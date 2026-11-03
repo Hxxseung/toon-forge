@@ -1,0 +1,9 @@
+tests/_tmp/outputs/
+*.png
+*.json
+*.log
+*.npz
+*.pyc
+*.csv
+*.txt
+data/
