@@ -1,9 +1,25 @@
-tests/_tmp/outputs/
-*.png
-*.json
-*.log
-*.npz
+# 원본 데이터 (works.csv 는 작품 ID 표라 올림)
+data/*
+!data/works.csv
+
+# 생성물 (매니페스트·OCR·변형 이미지)
+outputs/
+check_*.png
+tests/_tmp/
+
+# Python
+__pycache__/
 *.pyc
-*.csv
-*.txt
-data/
+.ipynb_checkpoints/
+
+# 모델 가중치·로그
+*.pt
+*.pth
+*.safetensors
+*.npz
+*.log
+
+# 에디터·OS
+.vscode/
+.DS_Store
+.env
