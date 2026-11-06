@@ -1,0 +1,35 @@
+# 작품별 변형 표 예시 — 파일 이름을 <work_id>.yaml 로 복사해서 사용
+# 한 작품 안에서는 이 표를 고정해 모든 컷에 똑같이 적용 (사람이 검수 후 version 올리기)
+version: v1
+reviewed_by: ""
+
+# ── 텍스트 변형 ──────────────────────────────
+entities:            # 대사 속 고유명사 치환 (조사 자동 보정)
+  person:
+    카일: 레온
+    세라: 아리아
+  place:
+    천명산: 백운산
+  item:
+    흑막검: 월광검
+sfx:                 # 효과음 치환 (부분 문자열, 긴 것부터)
+  쾅: 콰앙
+  두근: 쿵쿵
+  댕: 뎅
+credit:
+  replace:           # 크레딧 문자열 치환
+    홍길동: 김가명
+    스튜디오A: 스튜디오Z
+  default_text: null # 매핑이 하나도 안 맞을 때 크레딧 블록 전체를 바꿀 문구 (null = 안 바꿈)
+
+# ── 이미지 변형 ──────────────────────────────
+character_redesign:  # from = 원작 외형 설명(영어 권장), to = 바꿀 외형
+  - name: 카일
+    from: "the young man with short black hair and a blue coat"
+    to: "silver shoulder-length hair, red eyes, a white hooded jacket"
+    ref_image: null   # qwen_plus 백엔드에서 참조 이미지 (configs/works 기준 경로)
+  - name: 세라
+    from: "the girl with long brown hair"
+    to: "short pink bob hair, green eyes, a black school uniform"
+background_redesign: "a modern city rooftop at dusk"
+style_target: "a soft watercolor webtoon style"

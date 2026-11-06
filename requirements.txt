@@ -1,0 +1,12 @@
+numpy
+pillow
+opencv-python-headless
+pyyaml
+# OCR (3.3.x CPU oneDNN 문제 → 3.2.2 고정)
+paddlepaddle-gpu==3.2.2   # CPU만 쓰면 paddlepaddle==3.2.2
+paddleocr>=3.0
+# 이미지 편집 / 의역
+torch
+diffusers>=0.35   # QwenImageEditPipeline, QwenImageEditPlusPipeline, FluxKontextPipeline
+transformers
+accelerate

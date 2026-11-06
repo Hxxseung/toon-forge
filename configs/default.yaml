@@ -1,0 +1,76 @@
+# 경로는 레포 루트 기준 상대 경로 또는 절대 경로
+data_root: data                 # data/originals/<work_id>/<episode>/*.jpg
+originals_dir: originals
+out_root: outputs               # outputs/{originals,ocr,variants,manifests}
+work_tables: configs/works      # 작품별 치환표·재설계표 (<work_id>.yaml)
+
+cut:
+  min_gutter: 40      # 이 높이 이상 이어진 단색 행에서 컷을 자름
+  min_cut_h: 80       # 이보다 낮은 조각은 버림
+  std_thr: 6.0        # 행 픽셀 표준편차가 이보다 작으면 여백
+  pad: 0
+  max_cut_h: 3000     # 이보다 긴 컷만 완화된 기준으로 재분할 (0 = 끔)
+  resplit_gutter: 10
+  resplit_std: 12.0
+  resplit_frac: 0.6   # 재분할 때 한 줄의 90% 이상이 흰/검정이면 여백 (말풍선이 여백을 가로질러도 인식, 0 = 끔)
+  merge_below: 200    # 이보다 짧은 조각(대사 띠·효과음)은 위 컷에 붙임 (0 = 끔)
+
+ocr:
+  min_score: 0.5
+  device: null        # 예: gpu:0 / cpu
+
+text:
+  default_level: full            # names | full | paraphrase
+  fuzzy_names: true              # OCR이 자모 1개 틀리게 읽은 이름도 치환
+  paraphrase_model: Qwen/Qwen2.5-7B-Instruct
+  fonts:                         # 카테고리별 폰트 (Ubuntu: sudo apt install fonts-nanum)
+    dialogue: /usr/share/fonts/truetype/nanum/NanumGothicBold.ttf
+    sfx: /usr/share/fonts/truetype/nanum/NanumGothicExtraBold.ttf
+    credit: /usr/share/fonts/truetype/nanum/NanumGothic.ttf
+
+image:
+  backend: qwen
+  axes: [character, background, style]
+  strengths: [weak, medium, strong]
+  seed_base: 0
+  protect_text: true             # 편집 후 텍스트 블록 영역은 원본 픽셀로 되돌림
+  backends:
+    dummy: {name: dummy}
+    qwen:
+      name: qwen
+      model_id: Qwen/Qwen-Image-Edit
+      steps: 50
+      guidance: 4.0              # true_cfg_scale
+      cpu_offload: false         # VRAM 부족하면 true
+      target_area: 1048576
+    qwen_plus:                   # 캐릭터 참조 이미지(ref_image) 사용 가능
+      name: qwen_plus
+      model_id: Qwen/Qwen-Image-Edit-2509
+      steps: 40
+      guidance: 4.0
+      cpu_offload: false
+      target_area: 1048576
+    flux_kontext:                # FLUX.1 Non-Commercial License — 공개 배포 전 확인
+      name: flux_kontext
+      model_id: black-forest-labs/FLUX.1-Kontext-dev
+      steps: 28
+      guidance: 2.5
+      cpu_offload: false
+      target_area: 1048576
+  templates:
+    keep_suffix: >-
+      Keep the exact same panel composition, camera angle, character poses, facial expressions,
+      number of characters and the story moment. Keep all speech bubbles and do not add, remove
+      or change any text or letters.
+    character:
+      weak: "Recolor the characters only: change hair color and outfit colors as follows: {design}."
+      medium: "Redesign the characters' hairstyle, hair color and outfit as follows: {design}."
+      strong: "Completely redesign the characters (face shape, eyes, hairstyle, hair color, outfit) as follows: {design}."
+    background:
+      weak: "Change only the colors and lighting of the background, keep the same place."
+      medium: "Replace the background details with {design}, keeping the same layout and perspective."
+      strong: "Replace the whole background with {design}."
+    style:
+      weak: "Slightly change the coloring and shading style of the image toward {design}."
+      medium: "Redraw the whole image in {design}, keeping line placement and composition."
+      strong: "Redraw the whole image in a clearly different art style: {design}."
