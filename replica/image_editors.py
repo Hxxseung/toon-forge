@@ -101,12 +101,57 @@ class FluxKontextEditor(_DiffusersEditor):
                          width=w, height=h, generator=self._gen(seed)).images[0]
 
 
-EDITORS = {"dummy": DummyEditor, "qwen": QwenEditor, "qwen_plus": QwenPlusEditor, "flux_kontext": FluxKontextEditor}
+class NunchakuQwenEditor(BaseEditor):
+    """Qwen-Image-Edit-2509 + Nunchaku 4-bit(INT4) 트랜스포머 — RTX 30/40 (VRAM 10~12GB)용.
+
+    VRAM < offload_threshold_gb 이면 트랜스포머 블록 단위 오프로드 + 나머지 순차 오프로드
+    (Nunchaku 공식 예제 방식). 시스템 RAM은 64GB 이상 권장.
+    """
+    name, supports_refs = "qwen_nunchaku", True
+
+    def __init__(self, base_model_id: str, transformer_repo: str, transformer_file: str, steps: int,
+                 guidance: float, device: str = "cuda", target_area: int = 1024 * 1024,
+                 offload_threshold_gb: float = 18, num_blocks_on_gpu: int = 1, **extra):
+        import torch
+        from diffusers import QwenImageEditPlusPipeline
+        from nunchaku import NunchakuQwenImageTransformer2DModel
+        torch.cuda.set_device(torch.device(device))
+        tr = NunchakuQwenImageTransformer2DModel.from_pretrained(f"{transformer_repo}/{transformer_file}")
+        self.pipe = QwenImageEditPlusPipeline.from_pretrained(base_model_id, transformer=tr, torch_dtype=torch.bfloat16)
+        vram = torch.cuda.get_device_properties(torch.device(device)).total_memory / 2**30
+        if vram > offload_threshold_gb:
+            self.pipe.enable_model_cpu_offload(device=device)
+            mode = "model_offload"
+        else:
+            tr.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=num_blocks_on_gpu)
+            self.pipe._exclude_from_cpu_offload.append("transformer")
+            self.pipe.enable_sequential_cpu_offload(device=device)
+            mode = f"block_offload(num_blocks_on_gpu={num_blocks_on_gpu})"
+        self.pipe.set_progress_bar_config(disable=True)
+        self.model_id = f"{base_model_id} + {transformer_repo}/{transformer_file}"
+        self.target_area, self.extra = target_area, extra
+        self.params = {"steps": steps, "guidance": guidance, "target_area": target_area,
+                       "quant": "nunchaku-int4", "offload": mode, **extra}
+
+    def edit(self, image, prompt, seed, refs=None):
+        import torch
+        w, h = snap_size(*image.size, self.target_area)
+        imgs = [image.convert("RGB").resize((w, h), Image.LANCZOS)] + [r.convert("RGB") for r in (refs or [])]
+        return self.pipe(image=imgs if len(imgs) > 1 else imgs[0], prompt=prompt,
+                         negative_prompt=self.extra.get("negative_prompt", " "),
+                         true_cfg_scale=self.params["guidance"], num_inference_steps=self.params["steps"],
+                         generator=torch.Generator(device="cpu").manual_seed(seed)).images[0]
 
 
-def build_editor(backend_cfg: dict[str, Any]) -> BaseEditor:
+EDITORS = {"dummy": DummyEditor, "qwen": QwenEditor, "qwen_plus": QwenPlusEditor,
+           "flux_kontext": FluxKontextEditor, "qwen_nunchaku": NunchakuQwenEditor}
+
+
+def build_editor(backend_cfg: dict[str, Any], device: str | None = None) -> BaseEditor:
     cfg = dict(backend_cfg)
     name = cfg.pop("name")
     if name == "dummy":
         return DummyEditor()
+    if device:
+        cfg["device"] = device
     return EDITORS[name](**cfg)

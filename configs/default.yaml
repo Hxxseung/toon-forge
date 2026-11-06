@@ -12,7 +12,7 @@ cut:
   max_cut_h: 3000     # 이보다 긴 컷만 완화된 기준으로 재분할 (0 = 끔)
   resplit_gutter: 10
   resplit_std: 12.0
-  resplit_frac: 0.6   # 재분할 때 한 줄의 90% 이상이 흰/검정이면 여백 (말풍선이 여백을 가로질러도 인식, 0 = 끔)
+  resplit_frac: 0.6   # 재분할 때 한 줄의 60% 이상이 흰/검정이면 여백 (엇갈린 컷·말풍선 대응, 0 = 끔)
   merge_below: 200    # 이보다 짧은 조각(대사 띠·효과음)은 위 컷에 붙임 (0 = 끔)
 
 ocr:
@@ -29,7 +29,7 @@ text:
     credit: /usr/share/fonts/truetype/nanum/NanumGothic.ttf
 
 image:
-  backend: qwen
+  backend: qwen_nunchaku         # RTX 3080(10~12GB)용. 24GB 이상이면 qwen_plus
   axes: [character, background, style]
   strengths: [weak, medium, strong]
   seed_base: 0
@@ -49,6 +49,18 @@ image:
       steps: 40
       guidance: 4.0
       cpu_offload: false
+      target_area: 1048576
+    qwen_nunchaku:               # Qwen-Image-Edit-2509 + Nunchaku INT4 (RTX 30/40). pip install nunchaku 필요
+      name: qwen_nunchaku
+      base_model_id: Qwen/Qwen-Image-Edit-2509
+      transformer_repo: nunchaku-ai/nunchaku-qwen-image-edit-2509
+      transformer_file: svdq-int4_r32-qwen-image-edit-2509.safetensors   # r128 = 품질↑ 속도↓
+      # Lightning(8스텝) 쓰려면: transformer_file을 HF 레포의 lightning-251115/ 안 8steps 파일로 바꾸고
+      #   steps: 8, guidance: 1.0
+      steps: 40
+      guidance: 4.0
+      offload_threshold_gb: 18   # VRAM이 이보다 작으면 블록 단위 오프로드
+      num_blocks_on_gpu: 1       # 3080 12GB면 2~4로 올려 속도↑ (OOM 나면 다시 내림)
       target_area: 1048576
     flux_kontext:                # FLUX.1 Non-Commercial License — 공개 배포 전 확인
       name: flux_kontext

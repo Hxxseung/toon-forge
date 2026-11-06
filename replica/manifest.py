@@ -8,6 +8,7 @@ CSV는 `export_csv`로 평탄화해서 뽑는다 (분석·공유용).
 from __future__ import annotations
 
 import csv
+import fcntl
 import hashlib
 import json
 import subprocess
@@ -124,11 +125,18 @@ class JsonlManifest:
         return rid in self._ids
 
     def append(self, rec) -> None:
+        """GPU별 프로세스가 같은 파일에 동시에 써도 줄이 섞이지 않게 파일 잠금 후 한 줄 기록."""
         d = asdict(rec) if hasattr(rec, "__dataclass_fields__") else dict(rec)
         if d[self.key] in self._ids:
             return
+        line = json.dumps(d, ensure_ascii=False) + "\n"
         with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(d, ensure_ascii=False) + "\n")
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                f.write(line)
+                f.flush()
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
         self._ids.add(d[self.key])
 
     def by_id(self) -> dict[str, dict]:

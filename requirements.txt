@@ -10,3 +10,5 @@ torch
 diffusers>=0.35   # QwenImageEditPipeline, QwenImageEditPlusPipeline, FluxKontextPipeline
 transformers
 accelerate
+# RTX 30/40에서 Qwen-Image-Edit 4-bit: torch·CUDA 버전에 맞는 휠을 https://github.com/nunchaku-tech/nunchaku/releases 에서 설치
+# nunchaku

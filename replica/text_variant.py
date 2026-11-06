@@ -30,7 +30,8 @@ class Paraphraser:
     PROMPT = ("다음 웹툰 대사를 의미와 말투(존댓말/반말), 감정은 그대로 두고 다른 표현으로 바꿔 써라. "
               "길이는 비슷하게, ⟦숫자⟧ 표시는 절대 바꾸지 말 것. 바꾼 대사 한 줄만 출력.\n대사: {text}")
 
-    def __init__(self, model_id: str = "Qwen/Qwen2.5-7B-Instruct", device: str = "cuda"):
+    def __init__(self, model_id: str = "Qwen/Qwen2.5-7B-Instruct", device: str = "auto"):
+        # device_map="auto": 7B bf16(~15GB)가 3080 한 장에 안 들어가면 두 GPU에 나눠 올림
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.tok = AutoTokenizer.from_pretrained(model_id)

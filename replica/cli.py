@@ -35,7 +35,12 @@ def _iter_originals(cfg, args):
     recs = list(M.originals_manifest(cfg["out_root"]).read())
     if args.works:
         recs = [r for r in recs if r["work_id"] in args.works]
-    return recs[: args.limit] if args.limit else recs
+    if args.limit:
+        recs = recs[: args.limit]
+    if args.shard:  # "i/n": 컷을 번갈아 나눔 (GPU별 프로세스 병렬 실행용)
+        i, n = map(int, args.shard.split("/"))
+        recs = recs[i::n]
+    return recs
 
 
 def _abs(cfg, rel: str) -> Path:
@@ -191,7 +196,7 @@ def _image_one(cfg, editor, r, axis, strength, man, ver, overwrite):
 
 def cmd_image(cfg, args):
     from .image_editors import build_editor
-    editor = build_editor(cfg["image"]["backends"][args.backend or cfg["image"]["backend"]])
+    editor = build_editor(cfg["image"]["backends"][args.backend or cfg["image"]["backend"]], args.device)
     man = M.variants_manifest(cfg["out_root"])
     ver = M.git_commit(Path(__file__).parent)
     for r in _iter_originals(cfg, args):
@@ -219,7 +224,8 @@ def cmd_both(cfg, args):
                     continue
                 pid = M.make_variant_id(r["cut_id"], "image", ax, st, seed)
                 if pid not in man:
-                    editor = editor or build_editor(cfg["image"]["backends"][args.backend or cfg["image"]["backend"]])
+                    editor = editor or build_editor(cfg["image"]["backends"][args.backend or cfg["image"]["backend"]],
+                                                    args.device)
                     _image_one(cfg, editor, r, ax, st, man, ver, False)
                 parent = man.by_id()[pid]
                 img = np.asarray(Image.open(_abs(cfg, parent["path"])).convert("RGB"))
@@ -253,6 +259,8 @@ def main(argv=None):
     ap.add_argument("--strength", nargs="*", default=None)
     ap.add_argument("--text-level", default=None, choices=list(TEXT_LEVELS))
     ap.add_argument("--backend", default=None)
+    ap.add_argument("--shard", default=None, help="i/n — 컷을 n등분해 i번째만 처리 (예: GPU0은 0/2, GPU1은 1/2)")
+    ap.add_argument("--device", default=None, help="편집 모델을 올릴 장치 (예: cuda:0). CUDA_VISIBLE_DEVICES를 쓰면 생략")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     args.axis = args.axis or cfg["image"]["axes"]
