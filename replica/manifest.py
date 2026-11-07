@@ -1,195 +1,159 @@
-"""원작/변형 매니페스트.
+"""생성형 이미지 편집 백엔드.
 
-- originals.jsonl : 원작 컷 1개 = 1줄
-- variants.jsonl  : 변형 컷 1개 = 1줄 (원작 컷 ID로 정답 짝 연결)
-JSONL은 추가 전용(append-only)이며, 같은 ID가 이미 있으면 다시 만들지 않는다(재개 가능).
-CSV는 `export_csv`로 평탄화해서 뽑는다 (분석·공유용).
+모두 같은 인터페이스: editor.edit(image, prompt, seed, refs=None) -> PIL.Image
+- qwen       : Qwen/Qwen-Image-Edit (Apache-2.0)
+- qwen_plus  : Qwen/Qwen-Image-Edit-2509 (여러 장 입력 → 캐릭터 참조 이미지 사용 가능)
+- flux_kontext : black-forest-labs/FLUX.1-Kontext-dev (비상업 라이선스! 공개 데이터셋엔 주의)
+- dummy      : 모델 없이 색만 바꾸는 테스트용
+모델 버전은 바뀌므로 model_id는 config에서 덮어쓸 수 있게 함.
 """
 from __future__ import annotations
 
-import csv
-import fcntl
-import hashlib
-import json
-import subprocess
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
-VARIANT_TYPES = ("image", "text", "both")
+import numpy as np
+from PIL import Image
 
 
-def sha256_array(arr) -> str:
-    return hashlib.sha256(arr.tobytes()).hexdigest()
+def snap_size(w: int, h: int, target_area: int = 1024 * 1024, mult: int = 16) -> tuple[int, int]:
+    """비율 유지, 면적 ≈ target_area, 16의 배수. 세로로 긴 컷도 비율 그대로."""
+    s = (target_area / (w * h)) ** 0.5
+    return max(mult, round(w * s / mult) * mult), max(mult, round(h * s / mult) * mult)
 
 
-def sha256_file(path: str | Path, chunk: int = 1 << 20) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while b := f.read(chunk):
-            h.update(b)
-    return h.hexdigest()
+class BaseEditor:
+    name = "base"
+    model_id = ""
+    supports_refs = False
+    params: dict[str, Any] = {}
+
+    def edit(self, image: Image.Image, prompt: str, seed: int, refs: list[Image.Image] | None = None) -> Image.Image:
+        raise NotImplementedError
+
+    def info(self) -> dict[str, Any]:
+        return {"backend": self.name, "model_id": self.model_id, **self.params}
 
 
-def git_commit(repo_dir: str | Path = ".") -> str:
-    try:
-        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=repo_dir,
-                             capture_output=True, text=True, timeout=5)
-        dirty = subprocess.run(["git", "status", "--porcelain"], cwd=repo_dir,
-                               capture_output=True, text=True, timeout=5).stdout.strip()
-        return out.stdout.strip() + ("-dirty" if dirty else "") if out.returncode == 0 else "nogit"
-    except Exception:
-        return "nogit"
+class DummyEditor(BaseEditor):
+    name = "dummy"
+    model_id = "none"
+
+    def edit(self, image, prompt, seed, refs=None):
+        rng = np.random.default_rng(seed)
+        a = np.asarray(image.convert("RGB")).astype(np.int16)
+        a = np.clip(a[..., rng.permutation(3)] + rng.integers(-20, 20, 3), 0, 255).astype(np.uint8)
+        return Image.fromarray(a)
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+class _DiffusersEditor(BaseEditor):
+    pipe_cls = ""
+
+    def __init__(self, model_id: str, steps: int, guidance: float, device: str = "cuda",
+                 cpu_offload: bool = False, target_area: int = 1024 * 1024, **extra):
+        import torch
+        import diffusers
+        cls = getattr(diffusers, self.pipe_cls)
+        self.pipe = cls.from_pretrained(model_id, torch_dtype=torch.bfloat16)
+        if cpu_offload:
+            self.pipe.enable_model_cpu_offload()
+        else:
+            self.pipe.to(device)
+        self.pipe.set_progress_bar_config(disable=True)
+        self.model_id, self.target_area, self.extra = model_id, target_area, extra
+        self.params = {"steps": steps, "guidance": guidance, "target_area": target_area, **extra}
+
+    def _gen(self, seed):
+        import torch
+        return torch.Generator(device="cpu").manual_seed(seed)
 
 
-def make_cut_id(work_id: str, episode: str, cut_index: int) -> str:
-    return f"{work_id}__{episode}__c{cut_index:03d}"
+class QwenEditor(_DiffusersEditor):
+    name, pipe_cls = "qwen", "QwenImageEditPipeline"
+
+    def edit(self, image, prompt, seed, refs=None):
+        w, h = snap_size(*image.size, self.target_area)
+        out = self.pipe(image=image.convert("RGB").resize((w, h), Image.LANCZOS), prompt=prompt,
+                        negative_prompt=self.extra.get("negative_prompt", " "),
+                        true_cfg_scale=self.params["guidance"], num_inference_steps=self.params["steps"],
+                        generator=self._gen(seed)).images[0]
+        return out
 
 
-def make_variant_id(cut_id: str, variant_type: str, axis: str, strength: str, seed: int) -> str:
-    return f"{cut_id}__{variant_type}-{axis}-{strength}-s{seed}"
+class QwenPlusEditor(_DiffusersEditor):
+    name, pipe_cls, supports_refs = "qwen_plus", "QwenImageEditPlusPipeline", True
+
+    def edit(self, image, prompt, seed, refs=None):
+        w, h = snap_size(*image.size, self.target_area)
+        imgs = [image.convert("RGB").resize((w, h), Image.LANCZOS)] + [r.convert("RGB") for r in (refs or [])]
+        return self.pipe(image=imgs if len(imgs) > 1 else imgs[0], prompt=prompt,
+                         negative_prompt=self.extra.get("negative_prompt", " "),
+                         true_cfg_scale=self.params["guidance"], num_inference_steps=self.params["steps"],
+                         generator=self._gen(seed)).images[0]
 
 
-@dataclass
-class OriginalRecord:
-    cut_id: str
-    work_id: str
-    episode: str
-    cut_index: int
-    source_dir: str                # 원본 회차 폴더 (data_root 기준). 원본 컷 이미지는 저장하지 않음
-    width: int
-    height: int
-    sha256: str                    # 잘라낸 컷 픽셀(RGB uint8 배열)의 해시 — 원본이 바뀌었는지 확인용
-    source_slices: list[str]       # 이 컷이 걸쳐 있는 원본 조각 파일들
-    y_range: tuple[int, int]       # 회차를 이어 붙인 이미지에서의 세로 위치 → 이 범위를 잘라 원본 컷 복원
-    n_cuts_in_episode: int = -1
-    ocr_path: str | None = None    # OCR 결과 JSON (텍스트 블록)
-    created_at: str = field(default_factory=now_iso)
+class FluxKontextEditor(_DiffusersEditor):
+    name, pipe_cls = "flux_kontext", "FluxKontextPipeline"
+
+    def edit(self, image, prompt, seed, refs=None):
+        w, h = snap_size(*image.size, self.target_area)
+        return self.pipe(image=image.convert("RGB").resize((w, h), Image.LANCZOS), prompt=prompt,
+                         guidance_scale=self.params["guidance"], num_inference_steps=self.params["steps"],
+                         width=w, height=h, generator=self._gen(seed)).images[0]
 
 
-@dataclass
-class TextChange:
-    block_id: int
-    category: str                  # dialogue / sfx / credit
-    before: str
-    after: str
-    bbox: tuple[int, int, int, int]
-    rules: list[str]               # 적용된 규칙 (entity:카일→레온, josa, sfx_table, credit_table, llm_paraphrase ...)
+class NunchakuQwenEditor(BaseEditor):
+    """Qwen-Image-Edit-2509 + Nunchaku 4-bit(INT4) 트랜스포머 — RTX 30/40 (VRAM 10~12GB)용.
+
+    VRAM < offload_threshold_gb 이면 트랜스포머 블록 단위 오프로드 + 나머지 순차 오프로드
+    (Nunchaku 공식 예제 방식). 시스템 RAM은 64GB 이상 권장.
+    """
+    name, supports_refs = "qwen_nunchaku", True
+
+    def __init__(self, base_model_id: str, transformer_repo: str, transformer_file: str, steps: int,
+                 guidance: float, device: str = "cuda", target_area: int = 1024 * 1024,
+                 offload_threshold_gb: float = 18, num_blocks_on_gpu: int = 1, use_pin_memory: bool = False,
+                 **extra):
+        import torch
+        from diffusers import QwenImageEditPlusPipeline
+        from nunchaku import NunchakuQwenImageTransformer2DModel
+        torch.cuda.set_device(torch.device(device))
+        tr = NunchakuQwenImageTransformer2DModel.from_pretrained(f"{transformer_repo}/{transformer_file}")
+        self.pipe = QwenImageEditPlusPipeline.from_pretrained(base_model_id, transformer=tr, torch_dtype=torch.bfloat16)
+        vram = torch.cuda.get_device_properties(torch.device(device)).total_memory / 2**30
+        if vram > offload_threshold_gb:
+            self.pipe.enable_model_cpu_offload(device=device)
+            mode = "model_offload"
+        else:
+            # pin memory: CPU↔GPU 전송이 빨라지지만 RAM을 고정으로 더 씀 (프로세스 2개면 RAM 여유 필요)
+            tr.set_offload(True, use_pin_memory=use_pin_memory, num_blocks_on_gpu=num_blocks_on_gpu)
+            self.pipe._exclude_from_cpu_offload.append("transformer")
+            self.pipe.enable_sequential_cpu_offload(device=device)
+            mode = f"block_offload(num_blocks_on_gpu={num_blocks_on_gpu}, pin={use_pin_memory})"
+        self.pipe.set_progress_bar_config(disable=True)
+        self.model_id = f"{base_model_id} + {transformer_repo}/{transformer_file}"
+        self.target_area, self.extra = target_area, extra
+        self.params = {"steps": steps, "guidance": guidance, "target_area": target_area,
+                       "quant": "nunchaku-int4", "offload": mode, **extra}
+
+    def edit(self, image, prompt, seed, refs=None):
+        import torch
+        w, h = snap_size(*image.size, self.target_area)
+        imgs = [image.convert("RGB").resize((w, h), Image.LANCZOS)] + [r.convert("RGB") for r in (refs or [])]
+        return self.pipe(image=imgs if len(imgs) > 1 else imgs[0], prompt=prompt,
+                         negative_prompt=self.extra.get("negative_prompt", " "),
+                         true_cfg_scale=self.params["guidance"], num_inference_steps=self.params["steps"],
+                         generator=torch.Generator(device="cpu").manual_seed(seed)).images[0]
 
 
-@dataclass
-class VariantRecord:
-    variant_id: str
-    original_cut_id: str           # 정답 짝 — 원작 컷
-    work_id: str
-    episode: str
-    cut_index: int
-    variant_type: str              # image / text / both
-    axis: str                      # character / background / style / combo / text 등
-    strength: str                  # weak / medium / strong
-    seed: int
-    path: str
-    width: int
-    height: int
-    sha256: str
-    image_edit: dict[str, Any] | None = None   # backend, model_id, prompt, steps, guidance, protect_text ...
-    text_edit: dict[str, Any] | None = None    # table_version, changes[list[TextChange]], n_changed ...
-    parent_variant_id: str | None = None       # both = 이미지 변형 위에 텍스트 변형을 얹은 경우 그 이미지 변형 ID
-    qc: dict[str, Any] = field(default_factory=dict)
-    status: str = "ok"                         # ok / skipped_no_text / failed
-    code_version: str = ""
-    created_at: str = field(default_factory=now_iso)
+EDITORS = {"dummy": DummyEditor, "qwen": QwenEditor, "qwen_plus": QwenPlusEditor,
+           "flux_kontext": FluxKontextEditor, "qwen_nunchaku": NunchakuQwenEditor}
 
 
-class JsonlManifest:
-    def __init__(self, path: str | Path, key: str):
-        self.path = Path(path)
-        self.key = key
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._ids = {r[key] for r in self.read()} if self.path.exists() else set()
-
-    def read(self) -> Iterator[dict]:
-        if not self.path.exists():
-            return
-        with open(self.path, encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    yield json.loads(line)
-
-    def __contains__(self, rid: str) -> bool:
-        return rid in self._ids
-
-    def append(self, rec) -> None:
-        """GPU별 프로세스가 같은 파일에 동시에 써도 줄이 섞이지 않게 파일 잠금 후 한 줄 기록."""
-        d = asdict(rec) if hasattr(rec, "__dataclass_fields__") else dict(rec)
-        if d[self.key] in self._ids:
-            return
-        line = json.dumps(d, ensure_ascii=False) + "\n"
-        with open(self.path, "a", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                f.write(line)
-                f.flush()
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-        self._ids.add(d[self.key])
-
-    def by_id(self) -> dict[str, dict]:
-        return {r[self.key]: r for r in self.read()}
-
-
-def originals_manifest(out_root: str | Path) -> JsonlManifest:
-    return JsonlManifest(Path(out_root) / "manifests" / "originals.jsonl", "cut_id")
-
-
-def variants_manifest(out_root: str | Path) -> JsonlManifest:
-    return JsonlManifest(Path(out_root) / "manifests" / "variants.jsonl", "variant_id")
-
-
-VARIANT_CSV_COLS = [
-    "variant_id", "original_cut_id", "work_id", "episode", "cut_index", "variant_type",
-    "axis", "strength", "seed", "path", "original_source_dir", "original_y_start", "original_y_end",
-    "width", "height", "status",
-    "parent_variant_id", "backend", "model_id", "prompt", "n_text_changed", "text_changes",
-    "pixel_change_ratio", "sha256", "code_version", "created_at",
-]
-
-
-def export_csv(out_root: str | Path) -> tuple[Path, Path]:
-    """originals.csv / variants.csv (정답 짝 = original_cut_id) 생성."""
-    out_root = Path(out_root)
-    origs = originals_manifest(out_root).by_id()
-    o_csv = out_root / "manifests" / "originals.csv"
-    o_cols = ["cut_id", "work_id", "episode", "cut_index", "source_dir", "y_start", "y_end", "width", "height",
-              "n_cuts_in_episode", "ocr_path", "sha256"]
-    with open(o_csv, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=o_cols, extrasaction="ignore")
-        w.writeheader()
-        for r in origs.values():
-            w.writerow({**r, "y_start": r["y_range"][0], "y_end": r["y_range"][1]})
-
-    v_csv = out_root / "manifests" / "variants.csv"
-    with open(v_csv, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=VARIANT_CSV_COLS, extrasaction="ignore")
-        w.writeheader()
-        for r in variants_manifest(out_root).read():
-            ie, te = r.get("image_edit") or {}, r.get("text_edit") or {}
-            changes = te.get("changes", [])
-            o = origs.get(r["original_cut_id"], {})
-            yr = o.get("y_range", ["", ""])
-            w.writerow({
-                **r,
-                "original_source_dir": o.get("source_dir", ""),
-                "original_y_start": yr[0], "original_y_end": yr[1],
-                "backend": ie.get("backend", ""), "model_id": ie.get("model_id", ""),
-                "prompt": ie.get("prompt", ""),
-                "n_text_changed": len(changes),
-                "text_changes": " | ".join(f"{c['before']}→{c['after']}" for c in changes),
-                "pixel_change_ratio": r.get("qc", {}).get("pixel_change_ratio", ""),
-            })
-    return o_csv, v_csv
+def build_editor(backend_cfg: dict[str, Any], device: str | None = None) -> BaseEditor:
+    cfg = dict(backend_cfg)
+    name = cfg.pop("name")
+    if name == "dummy":
+        return DummyEditor()
+    if device:
+        cfg["device"] = device
+    return EDITORS[name](**cfg)

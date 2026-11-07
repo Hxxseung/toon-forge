@@ -111,7 +111,8 @@ class NunchakuQwenEditor(BaseEditor):
 
     def __init__(self, base_model_id: str, transformer_repo: str, transformer_file: str, steps: int,
                  guidance: float, device: str = "cuda", target_area: int = 1024 * 1024,
-                 offload_threshold_gb: float = 18, num_blocks_on_gpu: int = 1, **extra):
+                 offload_threshold_gb: float = 18, num_blocks_on_gpu: int = 1, use_pin_memory: bool = False,
+                 **extra):
         import torch
         from diffusers import QwenImageEditPlusPipeline
         from nunchaku import NunchakuQwenImageTransformer2DModel
@@ -123,10 +124,11 @@ class NunchakuQwenEditor(BaseEditor):
             self.pipe.enable_model_cpu_offload(device=device)
             mode = "model_offload"
         else:
-            tr.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=num_blocks_on_gpu)
+            # pin memory: CPU↔GPU 전송이 빨라지지만 RAM을 고정으로 더 씀 (프로세스 2개면 RAM 여유 필요)
+            tr.set_offload(True, use_pin_memory=use_pin_memory, num_blocks_on_gpu=num_blocks_on_gpu)
             self.pipe._exclude_from_cpu_offload.append("transformer")
             self.pipe.enable_sequential_cpu_offload(device=device)
-            mode = f"block_offload(num_blocks_on_gpu={num_blocks_on_gpu})"
+            mode = f"block_offload(num_blocks_on_gpu={num_blocks_on_gpu}, pin={use_pin_memory})"
         self.pipe.set_progress_bar_config(disable=True)
         self.model_id = f"{base_model_id} + {transformer_repo}/{transformer_file}"
         self.target_area, self.extra = target_area, extra

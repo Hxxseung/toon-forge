@@ -61,6 +61,7 @@ image:
       guidance: 4.0
       offload_threshold_gb: 18   # VRAM이 이보다 작으면 블록 단위 오프로드
       num_blocks_on_gpu: 1       # 3080 12GB면 2~4로 올려 속도↑ (OOM 나면 다시 내림)
+      use_pin_memory: false      # RAM 여유가 크면(프로세스당 +10GB 이상) true → 오프로드 전송 속도↑
       target_area: 1048576
     flux_kontext:                # FLUX.1 Non-Commercial License — 공개 배포 전 확인
       name: flux_kontext

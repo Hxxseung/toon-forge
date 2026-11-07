@@ -2,9 +2,10 @@
 
 작품 ID는 data/works.csv 에 고정 저장 (다시 실행하거나 작품이 늘어도 기존 ID 유지).
 
-python tools/prepare_data.py --src data                    # 전체 목록만 출력 (링크 안 만듦)
-python tools/prepare_data.py --src data --pick 1 5 9 12 20 # 목록 번호로 골라서 링크
-python tools/prepare_data.py --src data --pick all         # 전부 링크
+python tools/prepare_data.py --src data/WebToon                    # 전체 목록만 출력 (링크 안 만듦)
+python tools/prepare_data.py --src data/WebToon --pick 1 5 9 12 20 # 목록 번호로 골라서 링크
+python tools/prepare_data.py --src data/WebToon --pick all         # 전부 링크
+링크는 항상 data/originals/ 에, 작품 ID 표는 항상 data/works.csv 에 (레포 루트에서 실행)
 """
 from __future__ import annotations
 
@@ -53,12 +54,14 @@ def main():
     ap.add_argument("--src", default="data")
     ap.add_argument("--dst", default=None, help="기본: <src>/originals")
     ap.add_argument("--pick", nargs="*", help="목록 번호들 또는 all")
+    ap.add_argument("--works-csv", default="data/works.csv", help="작품 ID 표 (git에 올라가는 위치로 고정)")
     a = ap.parse_args()
     src = Path(a.src).resolve()
-    dst = Path(a.dst).resolve() if a.dst else src / "originals"
+    dst = Path(a.dst).resolve() if a.dst else Path("data/originals").resolve()
 
     eps, bad = scan(src)
-    works_csv = src / "works.csv"
+    works_csv = Path(a.works_csv).resolve()
+    works_csv.parent.mkdir(parents=True, exist_ok=True)
     works = load_works(works_csv)
     for e in eps:  # 새 작품에만 다음 번호 부여
         key = (e["title"], e["author"])
@@ -97,7 +100,7 @@ def main():
             print(f"이미 있음: {link}")
             continue
         link.symlink_to(e["dir"], target_is_directory=True)
-        print(f"링크: {link.relative_to(src)} → {e['dir'].name}")
+        print(f"링크: {link} → {e['dir'].name}")
 
 
 if __name__ == "__main__":
