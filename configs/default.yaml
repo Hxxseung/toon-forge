@@ -28,12 +28,20 @@ text:
     sfx: /usr/share/fonts/truetype/nanum/NanumGothicExtraBold.ttf
     credit: /usr/share/fonts/truetype/nanum/NanumGothic.ttf
 
+people:                          # 사람 검출 (python -m replica.cli people)
+  model_id: google/owlv2-base-patch16-ensemble
+  queries: ["a person", "a human face"]
+  threshold: 0.25                # 낮추면 더 많이 잡음(오검출↑), 높이면 놓침↑
+
 image:
-  backend: qwen_nunchaku         # RTX 3080(10~12GB)용. 24GB 이상이면 qwen_plus
+  backend: qwen_nunchaku_lightning   # 8스텝 ~18s/장 @3080 (full 40스텝 ~167s/장과 품질 비슷, 2026-11-09 CAT 3화 비교)
   axes: [character, background, style]
   strengths: [weak, medium, strong]
   seed_base: 0
   protect_text: true             # 편집 후 텍스트 블록 영역은 원본 픽셀로 되돌림
+  require_person: true           # 캐릭터 축: 사람이 검출 안 된 컷은 건너뜀 (status: skipped_no_person)
+  person_mask: true              # 캐릭터 축: 사람 영역 밖은 원본으로 되돌림 (배경에 사람이 새로 생기는 것 방지)
+  person_mask_pad: 0.15          # 사람 박스를 가로·세로 15%씩 넓혀서 마스크 (헤어스타일 변화 여유)
   backends:
     dummy: {name: dummy}
     qwen:
@@ -50,18 +58,28 @@ image:
       guidance: 4.0
       cpu_offload: false
       target_area: 1048576
-    qwen_nunchaku:               # Qwen-Image-Edit-2509 + Nunchaku INT4 (RTX 30/40). pip install nunchaku 필요
+    qwen_nunchaku:               # Qwen-Image-Edit-2509 + Nunchaku INT4 (RTX 30/40). 정식 품질 (40스텝, ~167s/장 @3080)
       name: qwen_nunchaku
       base_model_id: Qwen/Qwen-Image-Edit-2509
       transformer_repo: nunchaku-ai/nunchaku-qwen-image-edit-2509
       transformer_file: svdq-int4_r32-qwen-image-edit-2509.safetensors   # r128 = 품질↑ 속도↓
-      # Lightning(8스텝) 쓰려면: transformer_file을 HF 레포의 lightning-251115/ 안 8steps 파일로 바꾸고
-      #   steps: 8, guidance: 1.0
       steps: 40
-      guidance: 4.0
+      guidance: 4.0              # true_cfg_scale (>1 이어야 negative_prompt가 적용됨)
+      negative_prompt: "extra people, additional characters, crowd, new speech bubbles, new text, letters, watermark, colorized, different art style, different composition"
       offload_threshold_gb: 18   # VRAM이 이보다 작으면 블록 단위 오프로드
       num_blocks_on_gpu: 1       # 3080 12GB면 2~4로 올려 속도↑ (OOM 나면 다시 내림)
       use_pin_memory: false      # RAM 여유가 크면(프로세스당 +10GB 이상) true → 오프로드 전송 속도↑
+      target_area: 1048576
+    qwen_nunchaku_lightning:     # 8스텝 증류 + CFG 끔 → 정식보다 훨씬 빠름. negative_prompt는 적용 안 됨
+      name: qwen_nunchaku
+      base_model_id: Qwen/Qwen-Image-Edit-2509
+      transformer_repo: nunchaku-ai/nunchaku-qwen-image-edit-2509
+      transformer_file: lightning-251115/svdq-int4_r32-qwen-image-edit-2509-lightning-8steps-251115.safetensors
+      steps: 8
+      guidance: 1.0
+      offload_threshold_gb: 18
+      num_blocks_on_gpu: 1
+      use_pin_memory: false
       target_area: 1048576
     flux_kontext:                # FLUX.1 Non-Commercial License — 공개 배포 전 확인
       name: flux_kontext
@@ -71,14 +89,38 @@ image:
       cpu_offload: false
       target_area: 1048576
   templates:
+    # 원칙: 바꿀 것을 '구체적으로' 하나씩 지시 + 나머지는 전부 그대로. 막연한 "다르게 그려라"는 새 그림을 그려 버림
     keep_suffix: >-
-      Keep the exact same panel composition, camera angle, character poses, facial expressions,
-      number of characters and the story moment. Keep all speech bubbles and do not add, remove
-      or change any text or letters.
+      Change nothing else. Keep every person's face, eyes, gender, age, body shape and identity exactly the same,
+      and keep the same number of people. Keep the exact same composition, framing, camera angle, poses,
+      facial expressions, background, and the same art style and line art (including how eyes are drawn).
+      Do not add, remove or replace any people, objects, speech bubbles, text or letters.
+    keep_gray: >-
+      This is a black-and-white manga panel: keep it black-and-white (grayscale screentone only), do not add color.
     character:
-      weak: "Recolor the characters only: change hair color and outfit colors as follows: {design}."
-      medium: "Redesign the characters' hairstyle, hair color and outfit as follows: {design}."
-      strong: "Completely redesign the characters (face shape, eyes, hairstyle, hair color, outfit) as follows: {design}."
+      # '다시 그려라'(redesign)는 인물 자체를 새로 그림 → 바꿀 부위(머리·옷)만 지정
+      weak: "Change only the hair color of the people in this image: {design}."
+      medium: "Change only the hair color and the clothing colors of the people in this image: {design}."
+      strong: "Change only the hairstyle, hair color and clothing colors of the people in this image: {design}."
+    # 치환표(character_redesign)가 없을 때 작품마다 고정으로 뽑는 변경 규칙 재료
+    # 주의: 옷 '종류'(교복·정장 등)를 바꾸는 표현은 넣지 말 것 — 모델이 인물을 통째로 새로 그림 (2026-11-09 파일럿)
+    auto_pools:
+      hair_from: [black, brown, blonde, red, white or silver, blue]
+      hair_to: [silver, pink, blue, green, purple, orange, platinum blonde, black, red, teal]
+      outfit:
+        - "recolor their clothes to different colors while keeping the same type and shape of clothing"
+        - "recolor their clothes with a different color and add a simple pattern (stripes or checks), keeping the same type and shape of clothing"
+        - "swap the main colors of their clothes (dark becomes light, light becomes dark), keeping the same type and shape of clothing"
+      gray_hair_tone:
+        - "dark hair becomes light (white) hair and light hair becomes dark (black) hair"
+        - "solid black hair becomes hair with light screentone shading"
+      gray_outfit:
+        - "change the screentone pattern of their clothes (plain becomes striped or checked), keeping the same type and shape of clothing"
+        - "dark clothes become light and light clothes become dark, keeping the same type and shape of clothing"
+      hairstyle_swap:
+        - "short hair becomes slightly longer and long hair becomes shorter, keeping the face unchanged"
+        - "straight hair becomes wavy hair and add or remove bangs, keeping the face unchanged"
+        - "tie long hair into a ponytail and give short hair a different parting, keeping the face unchanged"
     background:
       weak: "Change only the colors and lighting of the background, keep the same place."
       medium: "Replace the background details with {design}, keeping the same layout and perspective."

@@ -37,6 +37,18 @@ def _iter_originals(cfg, args):
     recs = list(M.originals_manifest(cfg["out_root"]).read())
     if args.works:
         recs = [r for r in recs if r["work_id"] in args.works]
+    if getattr(args, "only_person", False):  # 사람 검출 결과에서 사람이 있는 컷만
+        from .people import load_people
+        recs = [r for r in recs if (load_people(_abs(cfg, f"people/{r['cut_id']}.json")) or {}).get("has_person")]
+    if getattr(args, "per_work", None):  # 작품마다 N컷을 회차 전체에 고르게 (시드 고정 → 항상 같은 컷)
+        by_w: dict[str, list] = {}
+        for r in recs:
+            by_w.setdefault(r["work_id"], []).append(r)
+        recs = []
+        for w, rs in by_w.items():
+            n = min(args.per_work, len(rs))
+            idx = sorted({round(i * (len(rs) - 1) / max(1, n - 1)) for i in range(n)}) if n > 1 else [len(rs) // 2]
+            recs += [rs[i] for i in idx]
     if args.limit:
         recs = recs[: args.limit]
     if args.shard:  # "i/n": 컷을 번갈아 나눔 (GPU별 프로세스 병렬 실행용)
@@ -161,8 +173,52 @@ def cmd_ocr(cfg, args):
             load_original(cfg, r).save(tmp)
             lines = eng.lines(tmp)
         edge = r["cut_index"] in (0, r["n_cuts_in_episode"] - 1)
-        save_blocks(out, r["cut_id"], build_blocks(lines, is_edge_cut=edge))
+        save_blocks(out, r["cut_id"], build_blocks(lines, is_edge_cut=edge), raw_lines=lines)
         print(f"[ocr] {r['cut_id']}: {len(lines)} lines")
+
+
+def cmd_regroup(cfg, args):
+    """OCR을 다시 돌리지 않고, 저장된 원시 줄로 블록만 다시 묶음 (묶는 규칙을 바꿨을 때).
+    사람이 검수한 파일(reviewed: true)은 건드리지 않음."""
+    from .ocr import build_blocks, load_raw_lines, save_blocks
+    n = skipped = 0
+    for r in _iter_originals(cfg, args):
+        p = _abs(cfg, r["ocr_path"])
+        if not p.exists():
+            continue
+        d, raw = load_raw_lines(p)
+        if d.get("reviewed"):
+            skipped += 1
+            continue
+        edge = r["cut_index"] in (0, r["n_cuts_in_episode"] - 1)
+        before = len(d["blocks"])
+        blocks = build_blocks(raw, is_edge_cut=edge)
+        save_blocks(p, r["cut_id"], blocks, d.get("engine", "paddleocr-ppocrv5-ko"), raw_lines=raw)
+        n += 1
+        if args.verbose:
+            print(f"[regroup] {r['cut_id']}: {before} → {len(blocks)} blocks")
+    print(f"[regroup] {n}개 다시 묶음, 검수 완료라 건너뜀 {skipped}개")
+
+
+def cmd_people(cfg, args):
+    """컷마다 사람 검출 → outputs/people/<cut_id>.json (캐릭터 변형 대상 판정·편집 마스크용)."""
+    from .people import PersonDetector, save_people
+    pc = cfg.get("people", {})
+    todo = [r for r in _iter_originals(cfg, args)
+            if args.overwrite or not _abs(cfg, f"people/{r['cut_id']}.json").exists()]
+    if not todo:
+        print("[people] 할 작업 없음")
+        return
+    det = PersonDetector(pc.get("model_id", "google/owlv2-base-patch16-ensemble"),
+                         pc.get("queries", ["a person", "a human face"]), pc.get("threshold", 0.25),
+                         device=args.device)
+    prog = Progress("people", len(todo), args.workers)
+    for r in todo:
+        if not _claim(cfg, args, "people__" + r["cut_id"]):
+            continue
+        boxes = det.detect(load_original(cfg, r))
+        save_people(_abs(cfg, f"people/{r['cut_id']}.json"), r["cut_id"], boxes, det.info())
+        prog.step(f"{r['cut_id']} 사람 {'있음' if boxes else '없음'} ({len(boxes)})")
 
 
 def _make_paraphraser(cfg, level):
@@ -208,17 +264,31 @@ def cmd_text(cfg, args):
         print(f"[text] {vid}: {info['n_changed']} blocks")
 
 
-def _image_one(cfg, editor, r, axis, strength, man, ver, overwrite):
+def _image_one(cfg, editor, r, axis, strength, man, ver, overwrite, tag=""):
     from .image_variant import pixel_change_ratio, run_image_edit
     seed = stable_seed(r["cut_id"], axis, strength, base=cfg["image"]["seed_base"])
-    vid = M.make_variant_id(r["cut_id"], "image", axis, strength, seed)
+    vid = M.make_variant_id(r["cut_id"], "image", axis, strength, seed, tag)
     if vid in man and not overwrite:
         return vid
+    boxes = None
+    if axis == "character" and cfg["image"].get("require_person", True):
+        from .people import load_people
+        ppl = load_people(_abs(cfg, f"people/{r['cut_id']}.json"))
+        if ppl is not None and not ppl["has_person"]:  # 사람 없는 컷 → 캐릭터 변형 안 함 (모델이 사람을 새로 그려 넣음)
+            man.append(M.VariantRecord(
+                variant_id=vid, original_cut_id=r["cut_id"], work_id=r["work_id"], episode=r["episode"],
+                cut_index=r["cut_index"], variant_type="image", axis=axis, strength=strength, seed=seed,
+                path="", width=r["width"], height=r["height"], sha256="", status="skipped_no_person",
+                code_version=ver))
+            return vid
+        boxes = ppl["boxes"] if ppl and cfg["image"].get("person_mask", True) else None
     orig = load_original(cfg, r)
     blocks = _blocks(cfg, r) or []
     table = load_work_table(cfg["work_tables"], r["work_id"])
     out, info = run_image_edit(editor, orig, axis, strength, seed, cfg["image"]["templates"], table, blocks,
-                               protect=cfg["image"]["protect_text"], ref_root=cfg["work_tables"])
+                               protect=cfg["image"]["protect_text"], ref_root=cfg["work_tables"],
+                               work_id=r["work_id"], person_boxes=boxes,
+                               mask_pad=cfg["image"].get("person_mask_pad", 0.15))
     rel, sha = _save(cfg, out, "image", r, vid)
     man.append(M.VariantRecord(
         variant_id=vid, original_cut_id=r["cut_id"], work_id=r["work_id"], episode=r["episode"],
@@ -228,9 +298,9 @@ def _image_one(cfg, editor, r, axis, strength, man, ver, overwrite):
     return vid
 
 
-def _image_vid(cfg, r, ax, st):
+def _image_vid(cfg, r, ax, st, tag=""):
     seed = stable_seed(r["cut_id"], ax, st, base=cfg["image"]["seed_base"])
-    return M.make_variant_id(r["cut_id"], "image", ax, st, seed)
+    return M.make_variant_id(r["cut_id"], "image", ax, st, seed, tag)
 
 
 def cmd_image(cfg, args):
@@ -238,17 +308,23 @@ def cmd_image(cfg, args):
     man = M.variants_manifest(cfg["out_root"])
     ver = M.git_commit(Path(__file__).parent)
     jobs = [(r, ax, st) for r in _iter_originals(cfg, args) for ax in args.axis for st in args.strength]
-    todo = [j for j in jobs if args.overwrite or _image_vid(cfg, *j) not in man]
+    todo = [j for j in jobs if args.overwrite or _image_vid(cfg, *j, args.tag) not in man]
+    if cfg["image"].get("require_person", True) and any(ax == "character" for _, ax, _ in todo):
+        missing = sorted({r["cut_id"] for r, ax, _ in todo
+                          if ax == "character" and not _abs(cfg, f"people/{r['cut_id']}.json").exists()})
+        if missing:
+            raise SystemExit(f"사람 검출 결과가 없는 컷 {len(missing)}개 (예: {missing[0]}). "
+                             f"먼저 `python -m replica.cli people` 을 실행하세요.")
     if not todo:
         print("[image] 할 작업 없음")
         return
     prog = Progress("image", len(todo), args.workers)
     editor = build_editor(cfg["image"]["backends"][args.backend or cfg["image"]["backend"]], args.device)
     for r, ax, st in todo:
-        vid = _image_vid(cfg, r, ax, st)
+        vid = _image_vid(cfg, r, ax, st, args.tag)
         if not _claim(cfg, args, vid):
             continue
-        _image_one(cfg, editor, r, ax, st, man, ver, args.overwrite)
+        _image_one(cfg, editor, r, ax, st, man, ver, args.overwrite, args.tag)
         prog.step(vid)
 
 
@@ -264,17 +340,17 @@ def cmd_both(cfg, args):
     prog = Progress("both", len(jobs), args.workers)
     for r, ax, st in jobs:
         seed = stable_seed(r["cut_id"], ax, st, base=cfg["image"]["seed_base"])
-        vid = M.make_variant_id(r["cut_id"], "both", f"{ax}+text", f"{st}+{args.text_level}", seed)
+        vid = M.make_variant_id(r["cut_id"], "both", f"{ax}+text", f"{st}+{args.text_level}", seed, args.tag)
         if (vid in man and not args.overwrite) or _blocks(cfg, r) is None or not _claim(cfg, args, vid):
             continue
-        pid = M.make_variant_id(r["cut_id"], "image", ax, st, seed)
+        pid = M.make_variant_id(r["cut_id"], "image", ax, st, seed, args.tag)
         if pid not in man:
             man.refresh()  # 다른 GPU가 방금 만들었을 수 있음
         if pid not in man:
             if _claim(cfg, args, pid):  # 부모 이미지 변형을 여기서 생성 (모델은 처음 필요할 때만 로드)
                 editor = editor or build_editor(cfg["image"]["backends"][args.backend or cfg["image"]["backend"]],
                                                 args.device)
-                _image_one(cfg, editor, r, ax, st, man, ver, False)
+                _image_one(cfg, editor, r, ax, st, man, ver, False, args.tag)
             else:  # 다른 GPU가 만드는 중 → 끝날 때까지 기다림 (최대 30분)
                 t0 = time.time()
                 while pid not in man and time.time() - t0 < 1800:
@@ -284,6 +360,8 @@ def cmd_both(cfg, args):
                     print(f"[both] {pid} 대기 시간 초과 → 건너뜀", flush=True)
                     continue
         parent = man.by_id()[pid]
+        if parent["status"] != "ok":  # 사람 없는 컷 등으로 이미지 변형을 안 만든 경우
+            continue
         img = np.asarray(Image.open(_abs(cfg, parent["path"])).convert("RGB"))
         orig = np.asarray(load_original(cfg, r))
         out, tinfo = _text_variant(cfg, r, img, orig, args.text_level, para)
@@ -306,15 +384,19 @@ def cmd_export(cfg, args):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="replica")
-    ap.add_argument("command", choices=["cut", "ocr", "text", "image", "both", "export"])
+    ap.add_argument("command", choices=["cut", "ocr", "regroup", "people", "text", "image", "both", "export"])
+    ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("-c", "--config", default="configs/default.yaml")
     ap.add_argument("--works", nargs="*")
     ap.add_argument("--limit", type=int)
+    ap.add_argument("--per-work", type=int, help="작품마다 N컷을 회차 전체에서 고르게 뽑음 (파일럿 샘플용)")
+    ap.add_argument("--only-person", action="store_true", help="사람이 검출된 컷만 (people 결과 필요)")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--axis", nargs="*", default=None)
     ap.add_argument("--strength", nargs="*", default=None)
     ap.add_argument("--text-level", default=None, choices=list(TEXT_LEVELS))
     ap.add_argument("--backend", default=None)
+    ap.add_argument("--tag", default="", help="변형 ID 꼬리표 — 다른 설정으로 같은 컷을 비교할 때 (예: --tag lightning)")
     ap.add_argument("--shard", default=None, help="i/n — 컷을 n등분해 i번째만 처리 (예: GPU0은 0/2, GPU1은 1/2)")
     ap.add_argument("--device", default=None, help="편집 모델을 올릴 장치 (예: cuda:0). CUDA_VISIBLE_DEVICES를 쓰면 생략")
     ap.add_argument("--queue", default=None, help="작업 큐 이름. 같은 이름의 프로세스들이 작업을 나눠 가짐 (먼저 끝난 쪽이 더 가져감)")
@@ -324,7 +406,7 @@ def main(argv=None):
     args.axis = args.axis or cfg["image"]["axes"]
     args.strength = args.strength or cfg["image"]["strengths"]
     args.text_level = args.text_level or cfg["text"]["default_level"]
-    {"cut": cmd_cut, "ocr": cmd_ocr, "text": cmd_text, "image": cmd_image,
+    {"cut": cmd_cut, "ocr": cmd_ocr, "regroup": cmd_regroup, "people": cmd_people, "text": cmd_text, "image": cmd_image,
      "both": cmd_both, "export": cmd_export}[args.command](cfg, args)
 
 

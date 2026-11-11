@@ -1,14 +1,27 @@
+# 검증된 조합: RTX 3080 10GB ×2, 드라이버 535 (CUDA 12.2), Python 3.11
+# 설치 순서가 중요함 — README의 "설치" 참고
+#
+# 1) PyTorch (CUDA 12.8 빌드, 드라이버 535에서도 하위 호환으로 동작)
+#    pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+# 2) Nunchaku — PyPI의 'nunchaku'는 다른 패키지! 반드시 아래 휠로 (+ 는 %2B)
+#    pip install --no-deps "https://huggingface.co/nunchaku-ai/nunchaku/resolve/main/nunchaku-1.1.0%2Btorch2.8-cp311-cp311-linux_x86_64.whl"
+#    (torch2.11용 휠은 CUDA 13 빌드 → 드라이버 580 미만에서 동작 안 함)
+# 3) 나머지: pip install -r requirements.txt
+# 4) OCR은 paddle CPU 버전 — paddlepaddle-gpu는 torch의 NCCL을 덮어써 torch가 깨짐
+
 numpy
 pillow
 opencv-python-headless
 pyyaml
-# OCR (3.3.x CPU oneDNN 문제 → 3.2.2 고정)
-paddlepaddle-gpu==3.2.2   # CPU만 쓰면 paddlepaddle==3.2.2
-paddleocr>=3.0
-# 이미지 편집 / 의역
-torch
-diffusers>=0.35   # QwenImageEditPipeline, QwenImageEditPlusPipeline, FluxKontextPipeline
-transformers
+
+# Nunchaku 1.1.0과 맞는 버전 (diffusers 0.42 / transformers 5.x 는 QwenEmbedRope 인자 순서가 달라 오류)
+diffusers==0.36.0
+transformers>=4.56,<5
 accelerate
-# RTX 30/40에서 Qwen-Image-Edit 4-bit: torch·CUDA 버전에 맞는 휠을 https://github.com/nunchaku-tech/nunchaku/releases 에서 설치
-# nunchaku
+einops
+peft>=0.17
+sentencepiece
+
+# OCR (CPU)
+paddlepaddle==3.2.2
+paddleocr>=3.0

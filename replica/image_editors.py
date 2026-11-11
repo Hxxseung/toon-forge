@@ -39,6 +39,9 @@ class DummyEditor(BaseEditor):
     model_id = "none"
 
     def edit(self, image, prompt, seed, refs=None):
+        import os
+        import time
+        time.sleep(float(os.environ.get("DUMMY_SLEEP", 0)) * np.random.rand())  # 테스트용: GPU 속도 차이 흉내
         rng = np.random.default_rng(seed)
         a = np.asarray(image.convert("RGB")).astype(np.int16)
         a = np.clip(a[..., rng.permutation(3)] + rng.integers(-20, 20, 3), 0, 255).astype(np.uint8)
@@ -116,6 +119,8 @@ class NunchakuQwenEditor(BaseEditor):
         import torch
         from diffusers import QwenImageEditPlusPipeline
         from nunchaku import NunchakuQwenImageTransformer2DModel
+        if device == "cuda":  # 번호가 없으면 0번 (CUDA_VISIBLE_DEVICES로 한 장만 보이면 그게 0번)
+            device = "cuda:0"
         torch.cuda.set_device(torch.device(device))
         tr = NunchakuQwenImageTransformer2DModel.from_pretrained(f"{transformer_repo}/{transformer_file}")
         self.pipe = QwenImageEditPlusPipeline.from_pretrained(base_model_id, transformer=tr, torch_dtype=torch.bfloat16)
