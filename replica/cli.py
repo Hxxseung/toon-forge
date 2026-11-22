@@ -125,8 +125,27 @@ def _blocks(cfg, rec):
     return load_blocks(p) if p and p.exists() else None
 
 
+_FONT_CACHE: dict | None = None
+
+
 def _fonts(cfg):
-    return cfg["text"]["fonts"]
+    """카테고리별 폰트. 파일이 없으면 있는 폰트로 대체하고 한 번만 알림
+    (예: Ubuntu fonts-nanum 에는 NanumGothicExtraBold 가 없음 → fonts-nanum-extra)."""
+    global _FONT_CACHE
+    if _FONT_CACHE is not None:
+        return _FONT_CACHE
+    fonts = dict(cfg["text"]["fonts"])
+    ok = [p for p in fonts.values() if Path(p).exists()]
+    if not ok:
+        raise SystemExit(f"글자 폰트 파일이 하나도 없습니다: {sorted(set(fonts.values()))}\n"
+                         f"  sudo apt install fonts-nanum fonts-nanum-extra  또는 configs/default.yaml 의 text.fonts 경로를 수정하세요.")
+    fallback = fonts.get("dialogue") if Path(fonts.get("dialogue", "")).exists() else ok[0]
+    for k, p in fonts.items():
+        if not Path(p).exists():
+            print(f"[text] 폰트 없음: {k} = {p} → {fallback} 로 대체 (sudo apt install fonts-nanum-extra 로 설치 가능)")
+            fonts[k] = fallback
+    _FONT_CACHE = fonts
+    return fonts
 
 
 # ───────────────────────── commands
@@ -221,6 +240,83 @@ def cmd_people(cfg, args):
         prog.step(f"{r['cut_id']} 사람 {'있음' if boxes else '없음'} ({len(boxes)})")
 
 
+def cmd_qc(cfg, args):
+    """이미지 변형 품질 측정 (거르지 않고 측정만) → outputs/qc/<variant_id>.json + manifests/qc_<tag>.csv.
+    기준값을 정하기 위한 단계: 파일럿 결과에서 잘된 컷/망가진 컷의 값을 비교."""
+    import csv
+    import json
+    from .people import PersonDetector, load_people
+    from .qc import measure
+    pc = cfg.get("people", {})
+    rows = [v for v in M.variants_manifest(cfg["out_root"]).read()
+            if v["variant_type"] == "image" and v["status"] == "ok" and v["path"]
+            and (not args.tag or v["variant_id"].endswith("-" + args.tag))
+            and (not args.axis_filter or v["axis"] in args.axis_filter)]
+    if not rows:
+        print("[qc] 대상 변형 없음")
+        return
+    origs = M.originals_manifest(cfg["out_root"]).by_id()
+    det = PersonDetector(pc.get("model_id", "google/owlv2-base-patch16-ensemble"),
+                         pc.get("queries", ["a person", "a human face"]), pc.get("threshold", 0.25),
+                         device=args.device)
+    ocr = None
+    if not args.no_text:
+        from .ocr import PaddleKoreanOCR
+        ocr = PaddleKoreanOCR(cfg["ocr"]["min_score"], cfg["ocr"].get("device"))
+    prog = Progress("qc", len(rows), args.workers)
+    out_rows = []
+    for v in rows:
+        r = origs[v["original_cut_id"]]
+        qp = _abs(cfg, f"qc/{v['variant_id']}.json")
+        if qp.exists() and not args.overwrite:
+            out_rows.append(json.load(open(qp, encoding="utf-8")))
+            continue
+        if not _claim(cfg, args, "qc__" + v["variant_id"]):
+            continue
+        orig = np.asarray(load_original(cfg, r))
+        out = np.asarray(Image.open(_abs(cfg, v["path"])).convert("RGB"))
+        ppl = load_people(_abs(cfg, f"people/{r['cut_id']}.json")) or {"boxes": []}
+        q = measure(orig, out, ppl["boxes"], det.detect(Image.fromarray(out)),
+                    cfg["image"].get("person_mask_pad", 0.15), ocr, _blocks(cfg, r))
+        rec = {"variant_id": v["variant_id"], "original_cut_id": r["cut_id"], "axis": v["axis"],
+               "strength": v["strength"], **q}
+        qp.parent.mkdir(parents=True, exist_ok=True)
+        json.dump(rec, open(qp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        out_rows.append(rec)
+        prog.step(f"{v['variant_id']} {q}")
+    tag = args.tag or "all"
+    cp = _abs(cfg, f"manifests/qc_{tag}.csv")
+    cols = ["variant_id", "original_cut_id", "axis", "strength", "person_count_orig", "person_count_out",
+            "structure_ncc", "seam_score", "text_retention"]
+    with open(cp, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(sorted(out_rows, key=lambda x: x["variant_id"]))
+    print(f"[qc] {len(out_rows)}개 → {cp}")
+
+
+def cmd_reject(cfg, args):
+    """검토에서 뺄 변형 기록: python -m replica.cli reject <variant_id 또는 cut_id…> --reason "2명으로 늘어남"
+    cut_id만 주면 그 컷의 이미지 변형 전부(--strength로 좁힘)."""
+    ids, vs = [], list(M.variants_manifest(cfg["out_root"]).read())
+    if args.sheet:  # 비교 이미지 번호로 제외: --sheet check_123456.json --rows 3 7 12
+        import json
+        index = json.load(open(args.sheet, encoding="utf-8"))
+        for n in args.rows or []:
+            if str(n) not in index:
+                print(f"[reject] 번호 없음: #{n}")
+            ids += index.get(str(n), [])
+    for x in args.ids:
+        hit = [v["variant_id"] for v in vs if v["variant_id"] == x or (
+            v["original_cut_id"] == x and v["variant_type"] == "image"
+            and (not args.strength_given or v["strength"] in args.strength))]
+        if not hit:
+            print(f"[reject] 없음: {x}")
+        ids += hit
+    n = M.add_rejects(cfg["out_root"], ids, args.reason or "")
+    print(f"[reject] {n}개 추가 → outputs/manifests/rejects.csv (export·both에서 제외)")
+
+
 def _make_paraphraser(cfg, level):
     if not TEXT_LEVELS[level]["paraphrase"]:
         return None
@@ -236,9 +332,14 @@ def _text_variant(cfg, rec, base_img: np.ndarray, orig_img: np.ndarray, level: s
     table = load_work_table(cfg["work_tables"], rec["work_id"])
     lv = TEXT_LEVELS[level]
     changes = plan_changes(blocks, table, cfg["text"]["fuzzy_names"], para, lv["categories"])
-    out = apply_text_variant(base_img, blocks, changes, _fonts(cfg), orig_img=orig_img) if changes else None
     info = {"level": level, "table_version": table.get("version", "none"), "categories": list(lv["categories"]),
             "n_changed": len(changes), "changes": changes_to_dict(changes)}
+    try:  # 한 컷의 글자 렌더링 실패가 전체 실행을 멈추지 않게
+        out = apply_text_variant(base_img, blocks, changes, _fonts(cfg), orig_img=orig_img) if changes else None
+    except Exception as e:  # noqa: BLE001
+        info["error"] = f"{type(e).__name__}: {e}"
+        print(f"[text] {rec['cut_id']} 렌더링 실패 → 건너뜀 ({info['error']})", flush=True)
+        return None, info
     return out, info
 
 
@@ -246,22 +347,40 @@ def cmd_text(cfg, args):
     man = M.variants_manifest(cfg["out_root"])
     para = _make_paraphraser(cfg, args.text_level)
     ver = M.git_commit(Path(__file__).parent)
+    no_table, made = set(), 0
     for r in _iter_originals(cfg, args):
-        vid = M.make_variant_id(r["cut_id"], "text", "text", args.text_level, 0)
+        tver = _table_version(cfg, r["work_id"])
+        if tver is None:  # 치환표가 없으면 기록하지 않음 (나중에 표를 만들면 그때 생성)
+            no_table.add(r["work_id"])
+            continue
+        vid = M.make_variant_id(r["cut_id"], "text", "text", f"{args.text_level}@{tver}", 0)
         if (vid in man and not args.overwrite) or not _claim(cfg, args, vid):
             continue
         orig = np.asarray(load_original(cfg, r))
         out, info = _text_variant(cfg, r, orig, orig, args.text_level, para)
         base = dict(variant_id=vid, original_cut_id=r["cut_id"], work_id=r["work_id"], episode=r["episode"],
-                    cut_index=r["cut_index"], variant_type="text", axis="text", strength=args.text_level,
+                    cut_index=r["cut_index"], variant_type="text", axis="text", strength=f"{args.text_level}@{tver}",
                     seed=0, width=r["width"], height=r["height"], text_edit=info, code_version=ver)
-        if out is None:  # OCR 없음 / 바꿀 텍스트 없음 → 기록만 (재실행 시 건너뜀)
-            man.append(M.VariantRecord(**base, path="", sha256="", status="skipped_no_text" if info else "skipped_no_ocr"))
+        if out is None:  # OCR 없음 / 바꿀 텍스트 없음 / 렌더링 실패 → 기록 (실패는 failed_render로 남겨 나중에 확인)
+            st = "skipped_no_ocr" if not info else ("failed_render" if info.get("error") else "skipped_no_text")
+            man.append(M.VariantRecord(**base, path="", sha256="", status=st))
             continue
         rel, sha = _save(cfg, out, "text", r, vid)
         from .image_variant import pixel_change_ratio
         man.append(M.VariantRecord(**base, path=rel, sha256=sha, qc={"pixel_change_ratio": pixel_change_ratio(orig, out)}))
+        made += 1
         print(f"[text] {vid}: {info['n_changed']} blocks")
+    if no_table:
+        print(f"[text] 치환표 없음 → 건너뜀: {sorted(no_table)}  (python tools/make_tables.py 로 초안 생성)")
+    print(f"[text] 새로 만든 텍스트 변형 {made}개")
+
+
+def _table_version(cfg, work_id: str) -> str | None:
+    """작품 치환표 버전 (텍스트 변형 ID에 들어감 → 표를 고치고 버전을 올리면 새로 생성). 표가 없으면 None."""
+    p = Path(cfg["work_tables"]) / f"{work_id}.yaml"
+    if not p.exists():
+        return None
+    return str(load_work_table(cfg["work_tables"], work_id).get("version", "none"))
 
 
 def _image_one(cfg, editor, r, axis, strength, man, ver, overwrite, tag=""):
@@ -283,19 +402,54 @@ def _image_one(cfg, editor, r, axis, strength, man, ver, overwrite, tag=""):
             return vid
         boxes = ppl["boxes"] if ppl and cfg["image"].get("person_mask", True) else None
     orig = load_original(cfg, r)
+    o = np.asarray(orig)
     blocks = _blocks(cfg, r) or []
     table = load_work_table(cfg["work_tables"], r["work_id"])
-    out, info = run_image_edit(editor, orig, axis, strength, seed, cfg["image"]["templates"], table, blocks,
-                               protect=cfg["image"]["protect_text"], ref_root=cfg["work_tables"],
-                               work_id=r["work_id"], person_boxes=boxes,
-                               mask_pad=cfg["image"].get("person_mask_pad", 0.15))
+    pad = cfg["image"].get("person_mask_pad", 0.15)
+    qcc = cfg["image"].get("qc", {}) or {}
+    tries = 1 + (int(qcc.get("max_retries", 0)) if qcc.get("enabled") else 0)
+    attempts, best = [], None
+    for k in range(tries):  # QC 불합격이면 시드를 바꿔 다시 생성, 가장 나은(이음새가 작은) 결과를 남김
+        s_k = seed if k == 0 else stable_seed(r["cut_id"], axis, strength, "retry", k, base=cfg["image"]["seed_base"])
+        out, info = run_image_edit(editor, orig, axis, strength, s_k, cfg["image"]["templates"], table, blocks,
+                                   protect=cfg["image"]["protect_text"], ref_root=cfg["work_tables"],
+                                   work_id=r["work_id"], person_boxes=boxes, mask_pad=pad)
+        q = _qc_quick(o, out, boxes, pad, qcc)
+        attempts.append({"seed": s_k, **q})
+        if best is None or (q.get("structure_ncc") or -1) > (best[2].get("structure_ncc") or -1):  # 포즈가 가장 잘 유지된 시도
+            best = (out, info, q, s_k)
+        if not q["fail"]:
+            break
+    out, info, q, used_seed = best
     rel, sha = _save(cfg, out, "image", r, vid)
+    status = "failed_qc" if q["fail"] else "ok"  # failed_qc: 이미지는 남기되(확인용) both·평가에서는 제외
     man.append(M.VariantRecord(
         variant_id=vid, original_cut_id=r["cut_id"], work_id=r["work_id"], episode=r["episode"],
-        cut_index=r["cut_index"], variant_type="image", axis=axis, strength=strength, seed=seed,
+        cut_index=r["cut_index"], variant_type="image", axis=axis, strength=strength, seed=used_seed,
         path=rel, width=r["width"], height=r["height"], sha256=sha, image_edit=info, code_version=ver,
-        qc={"pixel_change_ratio": pixel_change_ratio(np.asarray(orig), out)}))
+        status=status,
+        qc={"pixel_change_ratio": pixel_change_ratio(o, out), **{k: v for k, v in q.items() if k != "fail"},
+            "attempts": attempts if len(attempts) > 1 else []}))
     return vid
+
+
+def _qc_quick(o: np.ndarray, out: np.ndarray, boxes, pad: float, qcc: dict) -> dict:
+    """생성 중 바로 계산하는 가벼운 QC (모델 없이). 기준값은 configs의 image.qc."""
+    from .people import people_mask
+    from .qc import seam_score, structure_ncc
+    if not boxes:
+        return {"fail": False, "flags": []}
+    m = people_mask(o.shape[:2], boxes, pad)
+    seam, ncc = seam_score(o, out, m), structure_ncc(o, out, m)
+    flags = []
+    if seam is not None and seam > qcc.get("seam_fail_gt", 0.28):
+        flags.append("seam")
+    # 목표가 '같은 포즈, 다른 캐릭터'이므로 사람 영역의 큰 형태가 무너지면(여러 명으로 바뀜 등) 불합격
+    if ncc is not None and ncc < qcc.get("structure_fail_lt", 0.4):
+        flags.append("low_structure")
+    fail = qcc.get("enabled", False) and bool(flags)
+    return {"fail": bool(fail), "seam_score": None if seam is None else round(seam, 4),
+            "structure_ncc": None if ncc is None else round(ncc, 4), "flags": flags}
 
 
 def _image_vid(cfg, r, ax, st, tag=""):
@@ -337,10 +491,14 @@ def cmd_both(cfg, args):
     para = _make_paraphraser(cfg, args.text_level)
     ver = M.git_commit(Path(__file__).parent)
     jobs = [(r, ax, st) for r in _iter_originals(cfg, args) for ax in args.axis for st in args.strength]
+    rejects = M.load_rejects(cfg["out_root"])
     prog = Progress("both", len(jobs), args.workers)
     for r, ax, st in jobs:
         seed = stable_seed(r["cut_id"], ax, st, base=cfg["image"]["seed_base"])
-        vid = M.make_variant_id(r["cut_id"], "both", f"{ax}+text", f"{st}+{args.text_level}", seed, args.tag)
+        tver = _table_version(cfg, r["work_id"])
+        if tver is None:
+            continue
+        vid = M.make_variant_id(r["cut_id"], "both", f"{ax}+text", f"{st}+{args.text_level}@{tver}", seed, args.tag)
         if (vid in man and not args.overwrite) or _blocks(cfg, r) is None or not _claim(cfg, args, vid):
             continue
         pid = M.make_variant_id(r["cut_id"], "image", ax, st, seed, args.tag)
@@ -360,7 +518,7 @@ def cmd_both(cfg, args):
                     print(f"[both] {pid} 대기 시간 초과 → 건너뜀", flush=True)
                     continue
         parent = man.by_id()[pid]
-        if parent["status"] != "ok":  # 사람 없는 컷 등으로 이미지 변형을 안 만든 경우
+        if parent["status"] != "ok" or pid in rejects:  # 사람 없음·QC 불합격·사람이 뺀 이미지 변형 위에는 안 만듦
             continue
         img = np.asarray(Image.open(_abs(cfg, parent["path"])).convert("RGB"))
         orig = np.asarray(load_original(cfg, r))
@@ -384,13 +542,19 @@ def cmd_export(cfg, args):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="replica")
-    ap.add_argument("command", choices=["cut", "ocr", "regroup", "people", "text", "image", "both", "export"])
+    ap.add_argument("command", choices=["cut", "ocr", "regroup", "people", "text", "image", "both", "qc", "reject", "export"])
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("-c", "--config", default="configs/default.yaml")
     ap.add_argument("--works", nargs="*")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--per-work", type=int, help="작품마다 N컷을 회차 전체에서 고르게 뽑음 (파일럿 샘플용)")
     ap.add_argument("--only-person", action="store_true", help="사람이 검출된 컷만 (people 결과 필요)")
+    ap.add_argument("--no-text", action="store_true", help="qc: 글자 보존 검사(OCR) 생략 → 빠름")
+    ap.add_argument("--axis-filter", nargs="*", help="qc: 이 축의 변형만")
+    ap.add_argument("ids", nargs="*", help="reject: 뺄 variant_id 또는 cut_id")
+    ap.add_argument("--reason", default="", help="reject: 이유")
+    ap.add_argument("--sheet", help="reject: compare_sheet가 만든 check_*.json")
+    ap.add_argument("--rows", nargs="*", type=int, help="reject: 그 비교 이미지의 번호들")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--axis", nargs="*", default=None)
     ap.add_argument("--strength", nargs="*", default=None)
@@ -403,10 +567,11 @@ def main(argv=None):
     ap.add_argument("--workers", type=int, default=1, help="함께 도는 프로세스 수 (남은 시간 계산용)")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
+    args.strength_given = args.strength is not None
     args.axis = args.axis or cfg["image"]["axes"]
     args.strength = args.strength or cfg["image"]["strengths"]
     args.text_level = args.text_level or cfg["text"]["default_level"]
-    {"cut": cmd_cut, "ocr": cmd_ocr, "regroup": cmd_regroup, "people": cmd_people, "text": cmd_text, "image": cmd_image,
+    {"cut": cmd_cut, "ocr": cmd_ocr, "regroup": cmd_regroup, "people": cmd_people, "qc": cmd_qc, "reject": cmd_reject, "text": cmd_text, "image": cmd_image,
      "both": cmd_both, "export": cmd_export}[args.command](cfg, args)
 
 

@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from replica import cli  # noqa: E402
+from replica.config import load_config  # noqa: E402
 from replica import manifest as M  # noqa: E402
 from replica.korean import substitute_entities  # noqa: E402
 from replica.ocr import Block, Line, save_blocks  # noqa: E402
@@ -94,13 +95,36 @@ def main():
             blocks = [Block(0, "dialogue", "\n".join(l.text for l in lines), bb, lines)]
         save_blocks(TMP / "outputs" / r["ocr_path"], r["cut_id"], blocks)
 
+    # 가짜 사람 검출 (실제로는 `cli people`이 OWLv2로 생성). 세 컷 모두 인물(타원) 있음
+    from replica.people import save_people
+    for r in origs:
+        save_people(TMP / "outputs" / f"people/{r['cut_id']}.json", r["cut_id"],
+                    [[60, 40, 260, 360, 0.9, "a person"]], {"model": "fake"})
+
     cli.main(["text", *c])
     cli.main(["image", *c, "--axis", "character", "--strength", "weak", "strong"])
     cli.main(["both", *c, "--axis", "character", "background", "--strength", "medium"])
     cli.main(["image", *c, "--axis", "character", "--strength", "weak"])  # 재실행 → 건너뛰어야 함
     cli.main(["export", *c])
 
-    vs = list(M.variants_manifest(TMP / "outputs").read())
+    # 사람 없는 컷: 캐릭터 변형 건너뜀 + both도 건너뜀, 배경 축은 그대로 생성
+    r2 = origs[2]
+    save_people(TMP / "outputs" / f"people/{r2['cut_id']}.json", r2["cut_id"], [], {"model": "fake"})
+    cli.main(["image", *c, "--axis", "character", "--strength", "medium", "--tag", "np"])
+    cli.main(["both", *c, "--axis", "character", "--strength", "medium", "--tag", "np"])
+    np_rows = [v for v in M.variants_manifest(TMP / "outputs").read() if v["variant_id"].endswith("-np")]
+    st = {(v["variant_type"], v["cut_index"]): v["status"] for v in np_rows}
+    print("no-person 테스트:", st)
+    assert st[("image", 2)] == "skipped_no_person" and ("both", 2) not in st and st[("both", 0)] == "ok"
+    for v in np_rows:  # 사람 영역 밖은 원본과 같아야 함 (마스크)
+        if v["variant_type"] == "image" and v["status"] == "ok":
+            import numpy as _np
+            o = _np.asarray(cli.load_original(load_config(c[1]), next(x for x in origs if x["cut_id"] == v["original_cut_id"])))
+            e = _np.asarray(Image.open(TMP / "outputs" / v["path"]))
+            assert _np.abs(o[:, 400:].astype(int) - e[:, 400:]).max() == 0, "마스크 밖이 바뀜"
+            assert _np.abs(o[100:300, 100:220].astype(int) - e[100:300, 100:220]).mean() > 5, "마스크 안이 안 바뀜"
+
+    vs = [v for v in M.variants_manifest(TMP / "outputs").read() if not v["variant_id"].endswith("-np")]
     by = {}
     for v in vs:
         by.setdefault((v["variant_type"], v["status"]), 0)

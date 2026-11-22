@@ -50,13 +50,17 @@ python -m replica.cli export                  # originals.csv / variants.csv
 VRAM이 부족하면 해당 백엔드의 `cpu_offload: true`.
 
 ### RTX 3080 ×2 (VRAM 10~12GB)
-- 백엔드 `qwen_nunchaku` (Qwen-Image-Edit-2509 + Nunchaku INT4, 블록 단위 오프로드). `pip install nunchaku` 필요, 시스템 RAM 64GB 이상 권장
-- GPU 2장은 메모리가 합쳐지지 않으므로 **컷을 반씩 나눠 GPU마다 프로세스 1개**:
+- 백엔드 `qwen_nunchaku` (Qwen-Image-Edit-2509 + Nunchaku INT4, 블록 단위 오프로드). 시스템 RAM: 프로세스당 ~32GB
+- GPU 메모리는 합쳐지지 않으므로 **GPU마다 프로세스 1개 + 공유 작업 큐**(먼저 끝난 GPU가 남은 일을 가져감):
   ```bash
-  bash tools/run_dual_gpu.sh image --axis character --strength weak medium strong
+  bash tools/run_gpus.sh "image --axis character --strength weak medium strong" \
+                         "both  --axis character --strength medium --text-level full"
+  tail -f logs/run_*/*.log      # GPU별 진행·장당 시간·남은 시간
+  watch -n1 nvidia-smi          # 두 GPU 모두 사용률이 올라가는지
   ```
-  (= `CUDA_VISIBLE_DEVICES=g python -m replica.cli image --shard g/2 …` 두 개). 매니페스트는 파일 잠금으로 안전하게 함께 기록됨
-- `cut`·`ocr`·`text`는 한 프로세스로 충분
+  명령을 여러 개 주면 GPU마다 이어서 실행 → 한쪽이 먼저 끝나도 다음 단계로 넘어감
+- CPU 작업 병렬: `CPU_WORKERS=2 bash tools/run_gpus.sh "ocr"`
+- 수동 실행: `CUDA_VISIBLE_DEVICES=0 python -m replica.cli image --queue myrun --workers 2 …` (다른 GPU도 같은 `--queue`)
 
 ## 테스트 (GPU·OCR 없이)
 ```bash

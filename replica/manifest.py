@@ -156,12 +156,36 @@ def variants_manifest(out_root: str | Path) -> JsonlManifest:
     return JsonlManifest(Path(out_root) / "manifests" / "variants.jsonl", "variant_id")
 
 
+def load_rejects(out_root: str | Path) -> dict[str, str]:
+    """사람이 검토해서 뺀 변형 (manifests/rejects.csv: variant_id,reason). 매니페스트는 그대로 두고 따로 기록."""
+    p = Path(out_root) / "manifests" / "rejects.csv"
+    if not p.exists():
+        return {}
+    with open(p, encoding="utf-8-sig") as f:
+        return {r["variant_id"]: r.get("reason", "") for r in csv.DictReader(f) if r.get("variant_id")}
+
+
+def add_rejects(out_root: str | Path, ids: list[str], reason: str) -> int:
+    p = Path(out_root) / "manifests" / "rejects.csv"
+    have = load_rejects(out_root)
+    new = [i for i in ids if i not in have]
+    write_header = not p.exists()
+    with open(p, "a", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(["variant_id", "reason", "created_at"])
+        for i in new:
+            w.writerow([i, reason, now_iso()])
+    return len(new)
+
+
 VARIANT_CSV_COLS = [
     "variant_id", "original_cut_id", "work_id", "episode", "cut_index", "variant_type",
     "axis", "strength", "seed", "path", "original_source_dir", "original_y_start", "original_y_end",
     "width", "height", "status",
     "parent_variant_id", "backend", "model_id", "prompt", "n_text_changed", "text_changes",
-    "pixel_change_ratio", "sha256", "code_version", "created_at",
+    "pixel_change_ratio", "seam_score", "structure_ncc", "qc_flags", "rejected", "reject_reason",
+    "sha256", "code_version", "created_at",
 ]
 
 
@@ -178,6 +202,7 @@ def export_csv(out_root: str | Path) -> tuple[Path, Path]:
         for r in origs.values():
             w.writerow({**r, "y_start": r["y_range"][0], "y_end": r["y_range"][1]})
 
+    rejects = load_rejects(out_root)
     v_csv = out_root / "manifests" / "variants.csv"
     with open(v_csv, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=VARIANT_CSV_COLS, extrasaction="ignore")
@@ -195,6 +220,12 @@ def export_csv(out_root: str | Path) -> tuple[Path, Path]:
                 "prompt": ie.get("prompt", ""),
                 "n_text_changed": len(changes),
                 "text_changes": " | ".join(f"{c['before']}→{c['after']}" for c in changes),
-                "pixel_change_ratio": r.get("qc", {}).get("pixel_change_ratio", ""),
+                "pixel_change_ratio": (r.get("qc") or {}).get("pixel_change_ratio", ""),
+                "seam_score": (r.get("qc") or {}).get("seam_score", ""),
+                "structure_ncc": (r.get("qc") or {}).get("structure_ncc", ""),
+                "qc_flags": "|".join((r.get("qc") or {}).get("flags", []) or []),
+                # 부모(이미지 변형)가 빠지면 그 위에 만든 both도 같이 빠짐
+                "rejected": r["variant_id"] in rejects or (r.get("parent_variant_id") or "") in rejects,
+                "reject_reason": rejects.get(r["variant_id"]) or rejects.get(r.get("parent_variant_id") or "", ""),
             })
     return o_csv, v_csv

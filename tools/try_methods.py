@@ -8,6 +8,9 @@
   D outline: C에서 스케치를 '바깥 윤곽선(실루엣)만'으로 → 얼굴·머리·옷 선을 주지 않아 새로 그리게 함
   E fill   : 원본에서 사람 자리를 회색 실루엣으로 지우고(희미한 큰 선만 남김) 그 자리에 새 캐릭터를 그리게 함
 D·E는 SAM(facebook/sam-vit-base)으로 사람 영역을 정밀하게 따서 씀 (실패하면 사각형으로 대체).
+  F / G  : 편집 모델 대신 SDXL 애니 모델 + ControlNet(깊이) + 인페인팅.
+           사람 영역(SAM)만 완전히 새로 그리되, 원본에서 뽑은 깊이 지도로 자세·윤곽을 따라가게 함.
+           F = 느슨하게(0.5), G = 자세를 더 강하게(0.85). Qwen 모델을 쓰지 않음 (3080 10GB에서 바로 동작).
 
 python tools/try_methods.py                                   # 기본 컷 8개
 python tools/try_methods.py --cuts w005__ep001__c126 w047__ep003__c047 --methods B C
@@ -159,6 +162,74 @@ def edit_seg(editor, seg, orig: Image.Image, boxes: list[list], prompt: str, see
     return out
 
 
+HAIR_COLORS = ["silver", "pink", "blonde", "red", "blue", "green", "purple", "orange", "white", "black"]
+HAIR_STYLES = ["short hair", "long hair", "ponytail", "wavy hair", "bob cut", "braid", "hair bun", "spiked hair"]
+OUTFITS = ["hoodie", "school uniform", "leather jacket", "kimono", "armor", "suit", "sweater", "cloak", "t-shirt and jeans"]
+NEG = ("multiple views, character sheet, reference sheet, collage, comic panels, text, speech bubble, watermark, "
+       "signature, lowres, bad anatomy, bad hands, extra limbs, blurry")
+
+
+def snap(w: int, h: int, area: int = 1024 * 1024, mult: int = 64) -> tuple[int, int]:
+    sc = (area / (w * h)) ** 0.5
+    return max(mult, round(w * sc / mult) * mult), max(mult, round(h * sc / mult) * mult)
+
+
+class SdxlControlInpaint:
+    """SDXL(애니 체크포인트) + ControlNet depth + 인페인팅. 마스크 안은 새로 그리고, 깊이 지도로 자세를 유지."""
+
+    def __init__(self, base: str, controlnet: str, depth_model: str):
+        import torch
+        from diffusers import ControlNetModel, StableDiffusionXLControlNetInpaintPipeline
+        from transformers import pipeline as hf_pipeline
+        cn = ControlNetModel.from_pretrained(controlnet, torch_dtype=torch.float16)
+        self.pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(base, controlnet=cn, torch_dtype=torch.float16)
+        self.pipe.enable_model_cpu_offload()
+        self.pipe.set_progress_bar_config(disable=True)
+        self.depth = hf_pipeline("depth-estimation", model=depth_model, device="cpu")
+
+    def __call__(self, crop: Image.Image, mask: np.ndarray, prompt: str, seed: int, scale: float, steps: int = 28):
+        import torch
+        w, h = snap(*crop.size)
+        img = crop.resize((w, h), Image.LANCZOS)
+        mk = Image.fromarray((mask * 255).astype(np.uint8)).resize((w, h), Image.NEAREST)
+        depth = self.depth(img)["depth"].convert("RGB").resize((w, h))
+        return self.pipe(prompt=prompt, negative_prompt=NEG, image=img, mask_image=mk, control_image=depth,
+                         width=w, height=h, strength=0.99, num_inference_steps=steps, guidance_scale=6.0,
+                         controlnet_conditioning_scale=scale,
+                         generator=torch.Generator("cpu").manual_seed(seed)).images[0]
+
+
+def edit_sdxl(gen, seg, orig: Image.Image, boxes: list[list], seed: int, pad: float, scale: float, gray: bool, work_id: str):
+    o = np.asarray(orig).copy()
+    out = o.copy()
+    H, W = o.shape[:2]
+    persons = [b[:4] for b in boxes if "face" not in str(b[5] if len(b) > 5 else "")] or [b[:4] for b in boxes]
+    prompts = []
+    for i, (x0, y0, x1, y1) in enumerate(cluster_boxes(boxes)):
+        pw, ph = (x1 - x0) * (pad + 0.15), (y1 - y0) * (pad + 0.15)
+        cx0, cy0, cx1, cy1 = int(max(0, x0 - pw)), int(max(0, y0 - ph)), int(min(W, x1 + pw)), int(min(H, y1 + ph))
+        if cx1 - cx0 < 32 or cy1 - cy0 < 32:
+            continue
+        crop = o[cy0:cy1, cx0:cx1]
+        inside = [[p[0] - cx0, p[1] - cy0, p[2] - cx0, p[3] - cy0] for p in persons
+                  if p[0] >= x0 - 5 and p[2] <= x1 + 5 and p[1] >= y0 - 5 and p[3] <= y1 + 5] \
+            or [[x0 - cx0, y0 - cy0, x1 - cx0, y1 - cy0]]
+        mask = seg.mask(crop, inside)
+        grow = max(4, int(min(crop.shape[:2]) * 0.03))
+        big = cv2.dilate(mask.astype(np.uint8), np.ones((2 * grow + 1, 2 * grow + 1), np.uint8)) > 0
+        rng = np.random.default_rng(stable_seed("sdxl-design", work_id, i))   # 작품·인물 순서별 고정 디자인
+        design = f"{rng.choice(HAIR_COLORS)} hair, {rng.choice(HAIR_STYLES)}, {rng.choice(OUTFITS)}"
+        count = "solo, " if len(inside) == 1 else ""
+        prompt = (f"{count}{design}, " + ("monochrome, greyscale, screentone, manga, " if gray else "")
+                  + "masterpiece, high score, great score, absurdres")
+        prompts.append(prompt)
+        e = gen(Image.fromarray(crop), big, prompt, seed + i, scale)
+        e = np.asarray(e.convert("RGB").resize((cx1 - cx0, cy1 - cy0), Image.LANCZOS))
+        m = soft(mask, grow)[..., None]
+        out[cy0:cy1, cx0:cx1] = (out[cy0:cy1, cx0:cx1] * (1 - m) + e * m).astype(np.uint8)
+    return out, prompts
+
+
 def edit_crops(editor, orig: Image.Image, boxes: list[list], prompt: str, seed: int, pad: float, use_sketch: bool):
     o = np.asarray(orig).copy()
     out = o.copy()
@@ -186,7 +257,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-c", "--config", default="configs/default.yaml")
     ap.add_argument("--cuts", nargs="*", default=DEFAULT_CUTS)
-    ap.add_argument("--methods", nargs="*", default=["C", "D", "E"], choices=["A", "B", "C", "D", "E"])
+    ap.add_argument("--methods", nargs="*", default=["F", "G"], choices=["A", "B", "C", "D", "E", "F", "G"])
+    ap.add_argument("--sdxl-base", default="cagliostrolab/animagine-xl-4.0", help="F·G용 SDXL 체크포인트")
+    ap.add_argument("--sdxl-controlnet", default="diffusers/controlnet-depth-sdxl-1.0")
+    ap.add_argument("--depth-model", default="depth-anything/Depth-Anything-V2-Small-hf")
     ap.add_argument("--no-sam", action="store_true", help="SAM 없이 사각형 마스크로 (비교·디버그용)")
     ap.add_argument("--backend", default=None)
     ap.add_argument("--height", type=int, default=520)
@@ -194,11 +268,13 @@ def main():
     cfg = load_config(a.config)
     out_root = Path(cfg["out_root"])
     origs = M.originals_manifest(out_root).by_id()
-    editor = build_editor(cfg["image"]["backends"][a.backend or cfg["image"]["backend"]])
+    editor = build_editor(cfg["image"]["backends"][a.backend or cfg["image"]["backend"]]) \
+        if set(a.methods) & set("ABCDE") else None
+    gen = SdxlControlInpaint(a.sdxl_base, a.sdxl_controlnet, a.depth_model) if set(a.methods) & set("FG") else None
     pad = cfg["image"].get("person_mask_pad", 0.2)
     pools = cfg["image"]["templates"]["auto_pools"]
     (out_root / "try").mkdir(parents=True, exist_ok=True)
-    seg = Segmenter(enabled=not a.no_sam) if set(a.methods) & {"D", "E"} else None
+    seg = Segmenter(enabled=not a.no_sam) if set(a.methods) & set("DEFG") else None
 
     rows = []
     for cid in a.cuts:
@@ -219,6 +295,13 @@ def main():
         res = {}
         for mth in a.methods:
             t0 = time.time()
+            if mth in ("F", "G"):
+                e, ps = edit_sdxl(gen, seg, orig, ppl["boxes"], seed, pad, {"F": 0.5, "G": 0.85}[mth], gray, r["work_id"])
+                e = protect_text(e, o, blocks)
+                Image.fromarray(e).save(out_root / "try" / f"{cid}__{mth}.png")
+                res[mth] = e
+                print(f"[try] {cid} {mth} {time.time() - t0:.0f}s | {ps}", flush=True)
+                continue
             tpl = {"A": P_WHOLE, "B": P_CROP, "C": P_SKETCH, "D": P_OUTLINE, "E": P_FILL}[mth]
             prompt = tpl.format(design=design) + (GRAY if gray else "")
             if mth == "A":
@@ -242,7 +325,8 @@ def main():
             font = ImageFont.load_default(size=22)
         except TypeError:
             font = ImageFont.load_default()
-        names = {"A": "A whole", "B": "B crop", "C": "C crop+sketch", "D": "D outline only", "E": "E gray fill"}
+        names = {"A": "A whole", "B": "B crop", "C": "C crop+sketch", "D": "D outline only", "E": "E gray fill",
+                 "F": "F sdxl depth 0.5", "G": "G sdxl depth 0.85"}
         for im, lab in zip(ims, [cid] + [names[m] for m in a.methods]):
             row.paste(im, (x, 40))
             d.text((x + 4, 8), lab, fill="black", font=font)

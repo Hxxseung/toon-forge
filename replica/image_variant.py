@@ -36,23 +36,19 @@ def auto_design(work_id: str, strength: str, gray: bool, pools: dict[str, Any]) 
         tone = pools["gray_hair_tone"][rng.integers(len(pools["gray_hair_tone"]))]
         style = pools["hairstyle_swap"][rng.integers(len(pools["hairstyle_swap"]))]
         cloth = _pick(rng, pools["gray_outfit"], 1)[0]
-        parts = {"weak": [tone], "medium": [tone, cloth], "strong": [tone, style, cloth]}[strength]
+        parts = {"weak": [tone, cloth], "medium": [tone, style, cloth], "strong": [tone, style, cloth]}[strength]
     else:
-        src = pools["hair_from"]
-        dst = _pick(rng, pools["hair_to"], len(src))
-        for i, a in enumerate(src):  # "blue → blue" 처럼 같은 색으로 가는 쌍 제거
-            if dst[i] in a:
-                alt = [c for c in pools["hair_to"] if c not in a and c not in dst]
-                dst[i] = alt[0] if alt else dst[(i + 1) % len(dst)]
-        hair = ", ".join(f"{a} hair becomes {b} hair" for a, b in zip(src, dst))
+        # 색 목록을 길게 나열하면 모델이 '등장인물 명단'으로 읽고 여러 명을 줄 세워 그림 (pilot3) → 규칙 2개만
+        c1, c2 = _pick(rng, pools["hair_dark_to"], 1)[0], _pick(rng, pools["hair_light_to"], 1)[0]
+        hair = f"dark hair becomes {c1} hair and light or colorful hair becomes {c2} hair"
         cloth = _pick(rng, pools["outfit"], 1)[0]
         style = pools["hairstyle_swap"][rng.integers(len(pools["hairstyle_swap"]))]
-        parts = {"weak": [hair], "medium": [hair, cloth], "strong": [hair, style, cloth]}[strength]
+        parts = {"weak": [hair, cloth], "medium": [hair, style, cloth], "strong": [hair, style, cloth]}[strength]
     return "; ".join(parts)
 
 
 def build_prompt(axis: str, strength: str, templates: dict[str, Any], table: dict[str, Any],
-                 work_id: str = "", gray: bool = False) -> tuple[str, list[str]]:
+                 work_id: str = "", gray: bool = False, n_people: int | None = None) -> tuple[str, list[str]]:
     """반환: (프롬프트, 참조 이미지 경로들)"""
     t = templates[axis][strength]
     design, refs = "", []
@@ -68,6 +64,8 @@ def build_prompt(axis: str, strength: str, templates: dict[str, Any], table: dic
     elif axis == "style":
         design = table.get("style_target") or "a different digital webtoon art style"
     keep = templates["keep_suffix"].strip()
+    if axis == "character" and n_people == 1:  # 한 명뿐인 컷에서 여러 명을 그리는 실패가 가장 많음
+        keep += " " + templates["keep_single"].strip()
     if gray:
         keep += " " + templates["keep_gray"].strip()
     return t.format(design=design).strip() + " " + keep, refs
@@ -95,7 +93,11 @@ def run_image_edit(editor, orig: Image.Image, axis: str, strength: str, seed: in
                    person_boxes: list | None = None, mask_pad: float = 0.15) -> tuple[np.ndarray, dict[str, Any]]:
     """person_boxes가 주어지면(캐릭터 축) 사람 영역 밖은 원본으로 되돌림 → 배경에 사람·물체가 새로 생기는 것 방지."""
     gray = is_grayscale(orig)
-    prompt, ref_paths = build_prompt(axis, strength, templates, table, work_id, gray)
+    n_people = None
+    if person_boxes:
+        from .people import cluster_boxes
+        n_people = len(cluster_boxes(person_boxes))
+    prompt, ref_paths = build_prompt(axis, strength, templates, table, work_id, gray, n_people)
     refs = [Image.open(Path(ref_root) / p) for p in ref_paths] if editor.supports_refs else []
     out = editor.edit(orig, prompt, seed, refs=refs or None)
     if out.size != orig.size:

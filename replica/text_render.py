@@ -40,14 +40,23 @@ def erase_block(img: np.ndarray, block: Block, pad: int = 4) -> np.ndarray:
     return cv2.inpaint(img, m, 3, cv2.INPAINT_TELEA)
 
 
-def _fit_font(font_path: str, lines: list[str], box_w: int, target_h: int, min_size: int = 8):
-    size = max(min_size, int(target_h * 1.15))
-    while size > min_size:
-        f = ImageFont.truetype(font_path, size)
-        if max(f.getlength(l) for l in lines) <= box_w:
-            return f
-        size -= 1
-    return ImageFont.truetype(font_path, min_size)
+MAX_FONT = 300  # OCR 블록이 비정상적으로 크게 잡혀도 이 이상으로는 열지 않음 (FreeType 오류 방지)
+
+
+def _fit_font(font_path: str, lines: list[str], box_w: int, target_h: int, min_size: int = 8,
+              max_size: int = MAX_FONT):
+    """박스 폭에 들어가는 가장 큰 글자 크기 (이분 탐색)."""
+    lines = [l for l in lines if l] or [" "]
+    lo, hi = min_size, int(min(max_size, max(min_size, target_h * 1.15)))
+    best = min_size
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        f = ImageFont.truetype(font_path, mid)
+        if max(f.getlength(l) for l in lines) <= max(1, box_w):
+            best, lo = mid, mid + 1
+        else:
+            hi = mid - 1
+    return ImageFont.truetype(font_path, best)
 
 
 def wrap_like(text: str, n_lines: int) -> list[str]:

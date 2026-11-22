@@ -44,6 +44,8 @@ class DummyEditor(BaseEditor):
         time.sleep(float(os.environ.get("DUMMY_SLEEP", 0)) * np.random.rand())  # 테스트용: GPU 속도 차이 흉내
         rng = np.random.default_rng(seed)
         a = np.asarray(image.convert("RGB")).astype(np.int16)
+        if os.environ.get("DUMMY_BREAK"):  # 테스트용: 구도가 무너진 결과 흉내 (QC 재시도 경로 확인)
+            return Image.fromarray(np.asarray(image.convert("RGB"))[::-1, ::-1].copy())
         a = np.clip(a[..., rng.permutation(3)] + rng.integers(-20, 20, 3), 0, 255).astype(np.uint8)
         return Image.fromarray(a)
 

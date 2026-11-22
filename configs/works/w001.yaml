@@ -1,0 +1,18 @@
+# w001 CAT (캣) / 강현준 — 2026-11-12 검토
+# 1화 분량이라 고유명사가 거의 없음. "고양아"는 고양이를 부르는 말이라 제외.
+# "나옹~"(c041)은 OCR이 '0'으로 읽어서 치환 불가 → OCR 수정 후 sfx에 추가 가능
+version: "v1"
+
+entities:
+  person:
+    "처용": "무진"      # 처용~? (부르는 이름)
+  place: {}
+  item: {}
+  term: {}
+
+sfx: {}
+
+credit:
+  replace:
+    "강현준": "누리"
+  default_text: null

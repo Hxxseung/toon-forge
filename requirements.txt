@@ -25,3 +25,6 @@ sentencepiece
 # OCR (CPU)
 paddlepaddle==3.2.2
 paddleocr>=3.0
+
+# 치환표 초안 (tools/make_tables.py) — 한국어 형태소 분석
+kiwipiepy

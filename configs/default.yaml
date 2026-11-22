@@ -41,7 +41,12 @@ image:
   protect_text: true             # 편집 후 텍스트 블록 영역은 원본 픽셀로 되돌림
   require_person: true           # 캐릭터 축: 사람이 검출 안 된 컷은 건너뜀 (status: skipped_no_person)
   person_mask: true              # 캐릭터 축: 사람 영역 밖은 원본으로 되돌림 (배경에 사람이 새로 생기는 것 방지)
-  person_mask_pad: 0.15          # 사람 박스를 가로·세로 15%씩 넓혀서 마스크 (헤어스타일 변화 여유)
+  person_mask_pad: 0.2           # 같은 사람 박스를 합친 뒤 가로·세로 20%씩 넓혀서 마스크 (헤어스타일 변화 여유)
+  qc:                            # 생성 직후 자동 검사 (2026-11-11 pilot2 40장으로 기준 설정)
+    enabled: true
+    max_retries: 2               # 불합격이면 시드를 바꿔 최대 2번 더 생성 → 그래도 불합격이면 status: failed_qc
+    seam_fail_gt: 0.28           # 사람 영역 경계 이음새
+    structure_fail_lt: 0.2       # 사람 영역의 큰 형태 유사도. pilot3: 여러 명으로 바뀐 불량 -0.00~0.38 / 정상 0.44~0.78
   backends:
     dummy: {name: dummy}
     qwen:
@@ -90,27 +95,31 @@ image:
       target_area: 1048576
   templates:
     # 원칙: 바꿀 것을 '구체적으로' 하나씩 지시 + 나머지는 전부 그대로. 막연한 "다르게 그려라"는 새 그림을 그려 버림
+    # 목표(2026-11-12 확정): 포즈·구도·인원·그림체는 그대로, 캐릭터는 아예 다른 사람으로 (2차창작의 캐릭터 재구성)
+    # 피할 것: 인원 증가, 시대·배경과 안 맞는 옷(교복 등) → 모델이 장면 전체를 새로 그림
     keep_suffix: >-
-      Change nothing else. Keep every person's face, eyes, gender, age, body shape and identity exactly the same,
-      and keep the same number of people. Keep the exact same composition, framing, camera angle, poses,
-      facial expressions, background, and the same art style and line art (including how eyes are drawn).
-      Do not add, remove or replace any people, objects, speech bubbles, text or letters.
+      Keep the exact same pose, body position, size and placement in the frame, camera angle, gesture and facial
+      expression for every person, and keep the same number of people with the same gender and age group.
+      Keep the background, composition, art style, line weight and coloring style exactly the same, and keep the
+      clothing appropriate to the same era and setting. Do not add or remove any people, objects, speech bubbles,
+      text or letters.
     keep_gray: >-
       This is a black-and-white manga panel: keep it black-and-white (grayscale screentone only), do not add color.
     character:
-      # '다시 그려라'(redesign)는 인물 자체를 새로 그림 → 바꿀 부위(머리·옷)만 지정
-      weak: "Change only the hair color of the people in this image: {design}."
-      medium: "Change only the hair color and the clothing colors of the people in this image: {design}."
-      strong: "Change only the hairstyle, hair color and clothing colors of the people in this image: {design}."
-    # 치환표(character_redesign)가 없을 때 작품마다 고정으로 뽑는 변경 규칙 재료
-    # 주의: 옷 '종류'(교복·정장 등)를 바꾸는 표현은 넣지 말 것 — 모델이 인물을 통째로 새로 그림 (2026-11-09 파일럿)
+      # 주의: "replace with a new character"류 표현 + 색 목록 → 사람을 여러 명 새로 그림 (pilot3). 있는 사람을 '고치는' 표현만 사용
+      weak: "Edit the people who are already in this image, in place: give them a different hairstyle, hair color and clothes ({design})."
+      medium: "Edit the people who are already in this image, in place, so each looks like a different character: a different face (eyes, eyebrows, face shape), hairstyle, hair color and clothes ({design})."
+      strong: "Edit the people who are already in this image, in place, so each is unrecognizable as the original character: a very different face, hairstyle, hair color, clothes and accessories ({design})."
+    keep_single: >-
+      There is exactly one person in this image: the result must show only that one person in the same place,
+      never a group or a lineup of characters.
+    # 치환표(character_redesign)가 없을 때 작품마다 고정으로 뽑는 디자인 재료
     auto_pools:
-      hair_from: [black, brown, blonde, red, white or silver, blue]
-      hair_to: [silver, pink, blue, green, purple, orange, platinum blonde, black, red, teal]
+      hair_dark_to: [silver, platinum blonde, pink, light blue, orange, white]
+      hair_light_to: [black, dark green, dark purple, navy, dark red]
       outfit:
-        - "recolor their clothes to different colors while keeping the same type and shape of clothing"
-        - "recolor their clothes with a different color and add a simple pattern (stripes or checks), keeping the same type and shape of clothing"
-        - "swap the main colors of their clothes (dark becomes light, light becomes dark), keeping the same type and shape of clothing"
+        - "a different outfit of the same era and kind of setting as the original with a new color palette"
+        - "a clearly different outfit design and colors that still fit the same era and setting"
       gray_hair_tone:
         - "dark hair becomes light (white) hair and light hair becomes dark (black) hair"
         - "solid black hair becomes hair with light screentone shading"
@@ -118,9 +127,9 @@ image:
         - "change the screentone pattern of their clothes (plain becomes striped or checked), keeping the same type and shape of clothing"
         - "dark clothes become light and light clothes become dark, keeping the same type and shape of clothing"
       hairstyle_swap:
-        - "short hair becomes slightly longer and long hair becomes shorter, keeping the face unchanged"
-        - "straight hair becomes wavy hair and add or remove bangs, keeping the face unchanged"
-        - "tie long hair into a ponytail and give short hair a different parting, keeping the face unchanged"
+        - "short hair becomes long hair and long hair becomes short hair"
+        - "straight hair becomes wavy or curly hair, with different bangs"
+        - "different hairstyles such as ponytails, buns, braids or undercuts"
     background:
       weak: "Change only the colors and lighting of the background, keep the same place."
       medium: "Replace the background details with {design}, keeping the same layout and perspective."

@@ -84,14 +84,42 @@ def load_people(path: str | Path) -> dict | None:
     return json.load(open(p, encoding="utf-8")) if p.exists() else None
 
 
-def people_mask(shape_hw: tuple[int, int], boxes: list[list], pad_ratio: float = 0.15, feather: int = 15) -> np.ndarray:
-    """사람 박스(가로·세로로 pad_ratio만큼 넓힘)의 합집합 → 0~1 마스크 (경계는 부드럽게)."""
+def cluster_boxes(boxes: list[list], gap_ratio: float = 0.3, x_overlap: float = 0.3) -> list[list[float]]:
+    """한 사람의 박스들(사람·얼굴, 타일 경계에서 위아래로 잘린 조각)을 하나의 사각형으로 합침.
+    겹치거나, 가로로 겹치면서 세로 틈이 박스 높이의 gap_ratio 이하면 같은 사람으로 봄."""
+    bs = [list(map(float, b[:4])) for b in boxes]
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(bs)):
+            for j in range(i + 1, len(bs)):
+                a, b = bs[i], bs[j]
+                ox = min(a[2], b[2]) - max(a[0], b[0])
+                oy = min(a[3], b[3]) - max(a[1], b[1])
+                wmin = max(1.0, min(a[2] - a[0], b[2] - b[0]))
+                hmax = max(a[3] - a[1], b[3] - b[1])
+                if (ox > 0 and oy > 0) or (ox / wmin >= x_overlap and -oy <= gap_ratio * hmax):
+                    bs[i] = [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
+                    del bs[j]
+                    changed = True
+                    break
+            if changed:
+                break
+    return bs
+
+
+def people_mask(shape_hw: tuple[int, int], boxes: list[list], pad_ratio: float = 0.2, feather: int = 15) -> np.ndarray:
+    """사람 영역 마스크 (0~1).
+    1) 같은 사람의 박스를 하나로 합침 → 박스 사이 틈에 원본 색 띠가 남지 않게
+    2) 가로·세로 pad_ratio만큼 넓힘
+    3) 바깥쪽으로만 부드럽게 (안쪽은 끝까지 1 → 머리·목을 가로지르는 반투명 띠 방지)"""
     H, W = shape_hw
     m = np.zeros((H, W), np.float32)
-    for x0, y0, x1, y1, *_ in boxes:
+    for x0, y0, x1, y1 in cluster_boxes(boxes):
         pw, ph = (x1 - x0) * pad_ratio, (y1 - y0) * pad_ratio
         m[int(max(0, y0 - ph)):int(min(H, y1 + ph)), int(max(0, x0 - pw)):int(min(W, x1 + pw))] = 1.0
     if feather:
         k = 2 * feather + 1
-        m = np.clip(cv2.GaussianBlur(m, (k, k), 0) * 2 - 0.5, 0, 1)  # 박스 안쪽은 1 유지, 바깥으로만 번짐
-    return m
+        grown = cv2.dilate(m, np.ones((k, k), np.uint8))
+        m = np.maximum(m, cv2.GaussianBlur(grown, (k, k), 0))
+    return np.clip(m, 0, 1)
